@@ -40,6 +40,10 @@ PegaProx is a powerful web-based management interface for Proxmox VE and XCP-ng 
   <a href="https://www.netwolk.ch">
     <img src="images/sponsors/sponsor2.png" alt="netwolk GmbH" width="200"/>
   </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://expertize.nl/">
+    <img src="images/sponsors/sponsor3.png" alt="Banner Oranje" width="200"/>
+  </a>
 </p>
 
 ### 🥇 Gold

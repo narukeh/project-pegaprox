@@ -770,7 +770,7 @@
             const sponsorLinks = {
                 1: 'https://socialfurr.com',
                 2: 'https://www.netwolk.ch',
-                3: null,
+                3: 'https://expertize.nl/',  // Banner Oranje - Platinum
                 4: null,
                 5: null,
                 6: null,
