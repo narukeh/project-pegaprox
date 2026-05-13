@@ -14,7 +14,7 @@ flask-sock>=0.6.0
 flask-compress>=1.14
 # Werkzeug explicit pin — defends against transitive resolution that could
 # downgrade to 2.x even with flask>=3 (rare but pip-audit reproducible).
-werkzeug>=3.0.3  # NS: CVE-2024-34069 RCE in debugger pin bypass
+werkzeug>=3.1.6  # NS: CVE-2024-34069 RCE in debugger pin bypass
 # urllib3 2.5.0+ closes Open Redirect (CVE-2025-50181) on top of the cookie
 # header fix that landed in 2.0.7. 2.6+ adds the deprecation cleanup.
 requests>=2.33.0
