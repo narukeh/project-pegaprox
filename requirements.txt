@@ -18,7 +18,7 @@ werkzeug>=3.0.3  # NS: CVE-2024-34069 RCE in debugger pin bypass
 # urllib3 2.5.0+ closes Open Redirect (CVE-2025-50181) on top of the cookie
 # header fix that landed in 2.0.7. 2.6+ adds the deprecation cleanup.
 requests>=2.33.0
-urllib3>=2.5.0
+urllib3==2.7.0
 
 # === Encryption & Security ===
 # NS May 2026 — cryptography 46.0.6/.0.7 patches CVE-2026-34073 + -39892,
