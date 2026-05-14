@@ -431,16 +431,19 @@ def _run_v2p_migration(task):
         hw = vm_data.get('hardware', {})
         
         # Firmware: user override or auto-detect from VMware
+        # MK May 2026 (#411): hoist `firmware` out of the auto-detect branch so
+        # the subsequent task.log line referencing it doesn't blow up with
+        # UnboundLocalError when the user explicitly picked OVMF/SeaBIOS in
+        # the wizard (bios_override != 'auto' path). Reported by @crcro.
+        firmware = hw.get('firmware', 'bios')
         bios_override = getattr(task, 'bios_override', 'auto') or 'auto'
         if bios_override != 'auto':
             bios = bios_override
             machine = 'q35' if bios == 'ovmf' else 'pc'
+        elif firmware == 'efi':
+            bios = 'ovmf'; machine = 'q35'
         else:
-            firmware = hw.get('firmware', 'bios')
-            if firmware == 'efi':
-                bios = 'ovmf'; machine = 'q35'
-            else:
-                bios = 'seabios'; machine = 'pc'
+            bios = 'seabios'; machine = 'pc'
         # persist for later stages (offline copy path post-processing)
         task._detected_bios = bios
         task._detected_machine = machine
