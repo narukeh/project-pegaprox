@@ -623,7 +623,16 @@ def main(debug_mode=False):
     g.init_ssh_semaphore(SSH_MAX_CONCURRENT)
 
     # Configure logging
-    log_level = logging.DEBUG if debug_mode else logging.WARNING
+    # MK May 2026 (#357): env-var override (PEGAPROX_LOG_LEVEL) wins over default
+    # but --debug still forces DEBUG so the troubleshooting path doesn't need an
+    # extra knob. Unset env + no --debug → previous WARNING default.
+    from pegaprox.constants import LOG_LEVEL as _ENV_LOG_LEVEL
+    if debug_mode:
+        log_level = logging.DEBUG
+    elif _ENV_LOG_LEVEL is not None:
+        log_level = _ENV_LOG_LEVEL
+    else:
+        log_level = logging.WARNING
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(name)s] %(levelname)s: %(message)s' if debug_mode else '%(message)s',

@@ -330,20 +330,24 @@ class PegaProxManager:
         # File handler - DEBUG level (for troubleshooting). Capped at 3h of data,
         # rotated content is discarded — see #345 / #348. 3h because 20+ node
         # clusters can hit ~100 MB/h, 6h was still rough on small disks.
-        from pegaprox.utils.log_handler import CappedTimedFileHandler
-        fh = CappedTimedFileHandler(f"{LOG_DIR}/{cluster_id}.log", when='H', interval=3, backupCount=0)
-        fh.setLevel(logging.DEBUG)
-        
+        #
+        # MK May 2026 (#357 SeeJayEmm): file handler is opt-out via env (operators
+        # shipping logs to a central collector don't want a local copy churning
+        # disk too) and level is configurable via PEGAPROX_FILE_LOG_LEVEL.
+        from pegaprox.constants import FILE_LOG_LEVEL as _FH_LVL, FILE_LOG_DISABLED as _FH_OFF
+        formatter = logging.Formatter('[%(asctime)s] [%(name)s] %(levelname)s: %(message)s')
+
+        if not _FH_OFF:
+            from pegaprox.utils.log_handler import CappedTimedFileHandler
+            fh = CappedTimedFileHandler(f"{LOG_DIR}/{cluster_id}.log", when='H', interval=3, backupCount=0)
+            fh.setLevel(_FH_LVL)
+            fh.setFormatter(formatter)
+            self.logger.addHandler(fh)
+
         # Console handler - INFO level (no DEBUG spam)
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-        
-        # Formatter
-        formatter = logging.Formatter('[%(asctime)s] [%(name)s] %(levelname)s: %(message)s')
-        fh.setFormatter(formatter)
         ch.setFormatter(formatter)
-        
-        self.logger.addHandler(fh)
         self.logger.addHandler(ch)
         
         # Proxmox API credentials (stored, not session)

@@ -135,16 +135,19 @@ class XcpngManager:
         self.logger.propagate = False
         if self.logger.handlers:
             self.logger.handlers.clear()
-        # 3h cap on the per-cluster log to keep disk under control (#345/#348)
-        from pegaprox.utils.log_handler import CappedTimedFileHandler
-        fh = CappedTimedFileHandler(f"{LOG_DIR}/{cluster_id}.log", when='H', interval=3, backupCount=0)
-        fh.setLevel(logging.DEBUG)
+        # 3h cap on the per-cluster log to keep disk under control (#345/#348).
+        # MK May 2026 (#357): file handler is opt-out; level configurable.
+        from pegaprox.constants import FILE_LOG_LEVEL as _FH_LVL, FILE_LOG_DISABLED as _FH_OFF
+        fmt = logging.Formatter('[%(asctime)s] [%(name)s] %(levelname)s: %(message)s')
+        if not _FH_OFF:
+            from pegaprox.utils.log_handler import CappedTimedFileHandler
+            fh = CappedTimedFileHandler(f"{LOG_DIR}/{cluster_id}.log", when='H', interval=3, backupCount=0)
+            fh.setLevel(_FH_LVL)
+            fh.setFormatter(fmt)
+            self.logger.addHandler(fh)
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-        fmt = logging.Formatter('[%(asctime)s] [%(name)s] %(levelname)s: %(message)s')
-        fh.setFormatter(fmt)
         ch.setFormatter(fmt)
-        self.logger.addHandler(fh)
         self.logger.addHandler(ch)
 
     # ──────────────────────────────────────────

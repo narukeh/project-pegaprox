@@ -45,6 +45,22 @@ STORAGE_CLUSTERS_FILE = os.path.join(CONFIG_DIR, 'storage_clusters.json')
 SSL_CERT_FILE = 'ssl/cert.pem'
 SSL_KEY_FILE = 'ssl/key.pem'
 LOG_DIR = 'logs'
+
+# MK May 2026 (#357 SeeJayEmm): expose log level + per-cluster file-handler
+# behaviour via env vars so operators shipping logs to a central collector
+# can mute the local file path. Falsy/unset = current defaults.
+#   PEGAPROX_LOG_LEVEL        — root + app logger level (DEBUG/INFO/WARNING/...)
+#   PEGAPROX_FILE_LOG_LEVEL   — level for the per-cluster logs/<id>.log handler
+#   PEGAPROX_DISABLE_FILE_LOG — '1'/'true' to skip attaching the FileHandler
+import logging as _logging
+def _parse_log_level(s: str, default):
+    if not isinstance(s, str) or not s.strip():
+        return default
+    lvl = getattr(_logging, s.strip().upper(), None)
+    return lvl if isinstance(lvl, int) else default
+LOG_LEVEL = _parse_log_level(os.environ.get('PEGAPROX_LOG_LEVEL', ''), None)
+FILE_LOG_LEVEL = _parse_log_level(os.environ.get('PEGAPROX_FILE_LOG_LEVEL', ''), _logging.DEBUG)
+FILE_LOG_DISABLED = os.environ.get('PEGAPROX_DISABLE_FILE_LOG', '').strip().lower() in ('1', 'true', 'yes', 'on')
 WEB_DIR = 'web'
 SSL_DIR = 'ssl'
 STATIC_DIR = 'static'
