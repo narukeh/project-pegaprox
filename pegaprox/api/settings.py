@@ -3125,7 +3125,47 @@ def generate_support_bundle():
                 except Exception as e:
                     zf.writestr(f"{bundle_prefix}/pegaprox_log_error.txt", f"Failed: {str(e)}")
             else:
-                zf.writestr(f"{bundle_prefix}/pegaprox.log", "Log file not found. Checked: " + ", ".join(possible_log_files))
+                # MK May 2026: when no log file exists, fall back to journald.
+                # Most LXC-appliance + systemd-service installs route logging
+                # straight to journald with no file backing (Marcus' bundle dives
+                # on #411 and #413 both hit "Log file not found" because of this).
+                # `journalctl -u pegaprox` returns the same lines the file would
+                # have held; we redact + cap the same way.
+                journal_text = None
+                journal_err = None
+                try:
+                    cp = subprocess.run(
+                        ['journalctl', '-u', 'pegaprox',
+                         '--since', '24 hours ago',
+                         '-n', '1000',
+                         '--no-pager', '--output=short'],
+                        capture_output=True, text=True, timeout=20, check=False,
+                    )
+                    if cp.returncode == 0 and (cp.stdout or '').strip():
+                        # Cap at last 1000 lines (in case --since-window had more)
+                        lines = (cp.stdout or '').splitlines(keepends=True)[-1000:]
+                        journal_text = ''.join(_redact_log(l) for l in lines)
+                    else:
+                        journal_err = (cp.stderr or '').strip()[:300] or f"rc={cp.returncode}, empty output"
+                except FileNotFoundError:
+                    journal_err = "journalctl binary not present (not a systemd host)"
+                except subprocess.TimeoutExpired:
+                    journal_err = "journalctl timed out after 20s"
+                except Exception as e:
+                    journal_err = f"{type(e).__name__}: {e}"
+
+                if journal_text:
+                    zf.writestr(
+                        f"{bundle_prefix}/pegaprox.log",
+                        "# Source: journalctl -u pegaprox --since '24 hours ago' (no log file on disk)\n"
+                        + journal_text,
+                    )
+                else:
+                    zf.writestr(
+                        f"{bundle_prefix}/pegaprox.log",
+                        "Log file not found. Checked paths: " + ", ".join(possible_log_files)
+                        + (f"\nJournald fallback also failed: {journal_err}" if journal_err else ""),
+                    )
 
             # collect per-cluster logs (top 10 most recent, skip huge reads)
             import glob as _glob
