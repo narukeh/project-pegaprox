@@ -90,7 +90,6 @@
             const [actionLoading, setActionLoading] = useState(null);
             const [expanded, setExpanded] = useState(false);
             const lastMetricsRef = useRef(null);
-            const lastNetRef = useRef({ netin: 0, netout: 0, time: Date.now() });
 
             // auto-dismiss update banner after 30s when completed (#183)
             useEffect(() => {
@@ -110,20 +109,15 @@
             useEffect(() => {
                 if (metrics && metrics !== lastMetricsRef.current) {
                     lastMetricsRef.current = metrics;
-                    
-                    // calc network rate
-                    const now = Date.now();
-                    const timeDiff = (now - lastNetRef.current.time) / 1000;
-                    const netinRate = timeDiff > 0 ? Math.max(0, (metrics.netin - lastNetRef.current.netin) / timeDiff) : 0;
-                    const netoutRate = timeDiff > 0 ? Math.max(0, (metrics.netout - lastNetRef.current.netout) / timeDiff) : 0;
-                    lastNetRef.current = { netin: metrics.netin || 0, netout: metrics.netout || 0, time: now };
-                    
+
+                    // #419 follow-up: backend netin/netout are already a rate (bytes/sec, rrddata AVERAGE),
+                    // not a cumulative counter — divide directly, no delta-over-time.
                     historyRef.current = {
                         cpu: [...historyRef.current.cpu.slice(1), metrics.cpu_percent || 0],
                         mem: [...historyRef.current.mem.slice(1), metrics.mem_percent || 0],
                         disk: [...historyRef.current.disk.slice(1), metrics.disk_percent || 0],
-                        netin: [...historyRef.current.netin.slice(1), netinRate / 1048576], // MB/s
-                        netout: [...historyRef.current.netout.slice(1), netoutRate / 1048576]
+                        netin: [...historyRef.current.netin.slice(1), (metrics.netin || 0) / 1048576], // MB/s
+                        netout: [...historyRef.current.netout.slice(1), (metrics.netout || 0) / 1048576]
                     };
                     forceUpdate(n => n + 1);
                 }
