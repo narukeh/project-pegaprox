@@ -2386,49 +2386,63 @@ def _drive_mirror_to_local(pve_mgr, task, node, vmid, drive_id, target_path, dis
         return False
     
     # Start drive-mirror: -n = reuse existing target, -f = skip size check
+    # MK May 2026 (#438 crcro): logging the exact command we sent + the full qmp
+    # response (not truncated to 150) so we can actually diagnose when the job
+    # doesn't register. Also raising the visible-in-block-jobs wait from 4s to
+    # 10s — larger sshfs-backed mirrors can take longer to enter the active
+    # state on slow target storage.
     mirror_cmd = f"drive_mirror -n -f {drive_id} {target_path} raw"
+    task.log(f"  drive-mirror cmd: qm monitor → {mirror_cmd}")
     ok, out = _qm_monitor_cmd(pve_mgr, node, vmid, mirror_cmd, timeout=30)
     out_str = str(out or '').strip()
-    
+
     if not ok:
         # Try without -f (older QEMU)
         mirror_cmd = f"drive_mirror -n {drive_id} {target_path} raw"
+        task.log(f"  drive-mirror retry without -f: {mirror_cmd}")
         ok, out = _qm_monitor_cmd(pve_mgr, node, vmid, mirror_cmd, timeout=30)
         out_str = str(out or '').strip()
-    
+
     if not ok:
-        task.log(f"  drive-mirror command failed: {out_str[:200]}")
+        task.log(f"  drive-mirror command failed: {out_str[:500]}")
         return False
-    
+
     if 'error' in out_str.lower():
-        task.log(f"  drive-mirror error: {out_str[:200]}")
+        task.log(f"  drive-mirror error: {out_str[:500]}")
         return False
-    
-    # Log the response (important for debugging!)
+
+    # Log the response (important for debugging — full, not truncated)
     if out_str:
-        task.log(f"  drive-mirror response: {out_str[:150]}")
-    
+        task.log(f"  drive-mirror response: {out_str[:500]}")
+
     # Set speed to unlimited
     _qm_monitor_cmd(pve_mgr, node, vmid, f"block_job_set_speed {drive_id} 0")
-    
-    # Verify job actually started (give it a moment)
+
+    # Verify job actually started — poll up to 10s with three checks
+    # (1s, then +3s, then +6s). Larger mirrors over slow storage can take a
+    # while to register in block-jobs.
     import time
     time.sleep(1)
     ok2, jobs = _qm_monitor_cmd(pve_mgr, node, vmid, "info block-jobs")
     if ok2 and drive_id in str(jobs):
         task.log(f"  drive-mirror started: {drive_id} → {target_path}")
         return True
-    
-    # Job not visible yet -- wait a bit more and retry
+
     time.sleep(3)
     ok3, jobs2 = _qm_monitor_cmd(pve_mgr, node, vmid, "info block-jobs")
     if ok3 and drive_id in str(jobs2):
-        task.log(f"  drive-mirror started (delayed): {drive_id} → {target_path}")
+        task.log(f"  drive-mirror started (delayed 4s): {drive_id} → {target_path}")
         return True
-    
-    # Job didn't start -- check QEMU log for actual error
-    task.log(f"  drive-mirror: job not visible in block-jobs after 4s")
-    task.log(f"  block-jobs output: {str(jobs2 or jobs or '')[:200]}")
+
+    time.sleep(6)
+    ok4, jobs3 = _qm_monitor_cmd(pve_mgr, node, vmid, "info block-jobs")
+    if ok4 and drive_id in str(jobs3):
+        task.log(f"  drive-mirror started (delayed 10s): {drive_id} → {target_path}")
+        return True
+
+    # Job didn't start within 10s — log the FULL block-jobs output (not 200-trunc'd)
+    task.log(f"  drive-mirror: job not visible in block-jobs after 10s")
+    task.log(f"  block-jobs output: {str(jobs3 or jobs2 or jobs or '(empty)')[:600]}")
     
     rc_log, out_log, _ = _pve_node_exec(pve_mgr, node,
         f"tail -10 /var/log/pve/qemu-server/{vmid}.log 2>/dev/null | grep -i 'mirror\\|error\\|block' | tail -3", timeout=10)
@@ -4389,19 +4403,27 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             
             while time.time() - start_t < 86400:
                 time.sleep(5)
-                
-                # Find copy PID if not known — match dd OR qemu-img depending on src_format
+
+                # Find copy PID if not known.
+                # MK May 2026 (#438 crcro): previous code pgrepped `v2p-copy-VMID-DI`
+                # FIRST, which matched the *bash wrapper script's* PID — not dd's.
+                # Then /proc/<bash>/io has near-zero write_bytes (bash itself doesn't
+                # write data), Method-1 returned 0, Method-2's regex (only qemu-img
+                # style) didn't match dd's `status=progress` output either, and the
+                # polling loop went silent forever. Match the actual dd/qemu-img
+                # process directly. The wrapper-script pgrep is left as a last-
+                # resort fallback only.
                 if not qimg_pid:
                     pgrep_pat = f"dd if=.*{di}|qemu-img convert.*{di}"
                     rc_pid, out_pid, _ = _pve_node_exec(pve_mgr, task.target_node,
-                        f"pgrep -f 'v2p-copy-{task.proxmox_vmid}-{di}' 2>/dev/null | head -1; "
-                        f"pgrep -f '{pgrep_pat}' 2>/dev/null | head -1",
+                        f"pgrep -f '{pgrep_pat}' 2>/dev/null | head -1; "
+                        f"pgrep -f 'v2p-copy-{task.proxmox_vmid}-{di}' 2>/dev/null | head -1",
                         timeout=5)
                     for line in str(out_pid or '').splitlines():
                         s = line.strip()
                         if s.isdigit():
                             qimg_pid = s; break
-                
+
                 # Method 1: Read /proc/PID/io for write_bytes (most reliable)
                 written = 0
                 if qimg_pid:
@@ -4413,15 +4435,28 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                         written = int(m_wb.group(1))
                     else:
                         qimg_pid = ''  # PID stale, re-detect next loop
-                
-                # Method 2: Fallback -- parse progress file
+
+                # Method 2: Fallback — parse progress file.
+                # MK May 2026 (#438): regex was qemu-img-only ('(N/100%)'). For
+                # src_format=raw we use dd with `status=progress`, which writes
+                # lines like "1234567890 bytes (1.2 GB, 1.1 GiB) copied, 12 s, 100 MB/s".
+                # Match dd's byte format too — keeps qemu-img matching for
+                # vmdk-descriptor sources.
                 if written == 0:
                     rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node,
                         f"tail -c 500 {progress_log} 2>/dev/null", timeout=10)
                     progress_str = str(out_p or '')
+                    # Try qemu-img convert -p format first
                     pct_matches = _re.findall(r'\((\d+\.?\d*)/100%\)', progress_str)
                     if pct_matches:
                         written = int(disk_total * float(pct_matches[-1]) / 100)
+                    else:
+                        # dd status=progress format — take the LAST bytes-copied number
+                        # (status=progress prints repeatedly with \r so the tail is
+                        # the most recent)
+                        dd_matches = _re.findall(r'(\d+)\s+bytes(?:\s+\([^)]*\))?\s+copied', progress_str)
+                        if dd_matches:
+                            written = int(dd_matches[-1])
                 
                 if written > 0:
                     current_pct = min(written * 100 / max(disk_total, 1), 100)
