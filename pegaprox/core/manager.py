@@ -11543,26 +11543,85 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"[ERROR] Toggle network link failed: {e}")
             return {'success': False, 'error': str(e)}
     
+    # NS May 2026 — PVE 9.2 added /cluster/cpu-models for admin-defined custom
+    # CPU profiles (see manager.cluster.cpu-models in pve-manager 9.2). We try
+    # to fetch + append on connect; on older clusters the endpoint 404s and
+    # the static list is returned unchanged.
+    _STATIC_CPU_TYPES = [
+        'host', 'kvm64', 'kvm32', 'qemu64', 'qemu32',
+        'max', 'x86-64-v2', 'x86-64-v2-AES', 'x86-64-v3', 'x86-64-v4',
+        'Broadwell', 'Broadwell-IBRS', 'Broadwell-noTSX', 'Broadwell-noTSX-IBRS',
+        'Cascadelake-Server', 'Cascadelake-Server-noTSX', 'Cascadelake-Server-v2',
+        'Conroe', 'Cooperlake', 'Cooperlake-v2',
+        'EPYC', 'EPYC-IBPB', 'EPYC-Milan', 'EPYC-Rome', 'EPYC-v3',
+        'Haswell', 'Haswell-IBRS', 'Haswell-noTSX', 'Haswell-noTSX-IBRS',
+        'Icelake-Client', 'Icelake-Client-noTSX', 'Icelake-Server', 'Icelake-Server-noTSX',
+        'IvyBridge', 'IvyBridge-IBRS',
+        'Nehalem', 'Nehalem-IBRS',
+        'Opteron_G1', 'Opteron_G2', 'Opteron_G3', 'Opteron_G4', 'Opteron_G5',
+        'Penryn', 'SandyBridge', 'SandyBridge-IBRS',
+        'SapphireRapids', 'Skylake-Client', 'Skylake-Client-IBRS',
+        'Skylake-Server', 'Skylake-Server-IBRS', 'Skylake-Server-noTSX-IBRS',
+        'Westmere', 'Westmere-IBRS', 'athlon', 'core2duo', 'coreduo',
+        'n270', 'pentium', 'pentium2', 'pentium3', 'phenom'
+    ]
+
     def get_cpu_types(self) -> List[str]:
-        
-        return [
-            'host', 'kvm64', 'kvm32', 'qemu64', 'qemu32', 
-            'max', 'x86-64-v2', 'x86-64-v2-AES', 'x86-64-v3', 'x86-64-v4',
-            'Broadwell', 'Broadwell-IBRS', 'Broadwell-noTSX', 'Broadwell-noTSX-IBRS',
-            'Cascadelake-Server', 'Cascadelake-Server-noTSX', 'Cascadelake-Server-v2',
-            'Conroe', 'Cooperlake', 'Cooperlake-v2',
-            'EPYC', 'EPYC-IBPB', 'EPYC-Milan', 'EPYC-Rome', 'EPYC-v3',
-            'Haswell', 'Haswell-IBRS', 'Haswell-noTSX', 'Haswell-noTSX-IBRS',
-            'Icelake-Client', 'Icelake-Client-noTSX', 'Icelake-Server', 'Icelake-Server-noTSX',
-            'IvyBridge', 'IvyBridge-IBRS',
-            'Nehalem', 'Nehalem-IBRS',
-            'Opteron_G1', 'Opteron_G2', 'Opteron_G3', 'Opteron_G4', 'Opteron_G5',
-            'Penryn', 'SandyBridge', 'SandyBridge-IBRS',
-            'SapphireRapids', 'Skylake-Client', 'Skylake-Client-IBRS', 
-            'Skylake-Server', 'Skylake-Server-IBRS', 'Skylake-Server-noTSX-IBRS',
-            'Westmere', 'Westmere-IBRS', 'athlon', 'core2duo', 'coreduo',
-            'n270', 'pentium', 'pentium2', 'pentium3', 'phenom'
-        ]
+        custom = self._fetch_custom_cpu_models()
+        if not custom:
+            return list(self._STATIC_CPU_TYPES)
+        # custom-* prefix is the convention PVE uses internally; surface as-is
+        existing = set(self._STATIC_CPU_TYPES)
+        extras = sorted({c for c in custom if c and c not in existing})
+        return list(self._STATIC_CPU_TYPES) + extras
+
+    def _fetch_custom_cpu_models(self) -> List[str]:
+        """PVE 9.2+: GET /cluster/cpu-models. Returns [] on older PVE / 404 / error."""
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/cpu-models"
+            resp = self._create_session().get(url, timeout=5)
+            if resp.status_code != 200:
+                return []
+            data = resp.json().get('data') or []
+            out = []
+            for entry in data:
+                # PVE returns {name: '...', vendor: '...', ...}; some builds
+                # nest under 'model' — accept both shapes.
+                name = entry.get('name') or entry.get('model') or ''
+                if name:
+                    out.append(name)
+            return out
+        except Exception:
+            return []
+
+    # MK May 2026 — pve version tuple cache. Used by feature-gates that decide
+    # whether to send 9.2+ -only fields. Cached on the manager instance; the
+    # cluster gets reconnected if the version changes anyway.
+    def get_pve_version_tuple(self):
+        """Returns (major, minor) tuple from /api2/json/version, e.g. (9, 2). None on error."""
+        cached = getattr(self, '_pve_version_cache', None)
+        if cached is not None:
+            return cached
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/version"
+            resp = self._create_session().get(url, timeout=5)
+            if resp.status_code != 200:
+                self._pve_version_cache = None
+                return None
+            data = resp.json().get('data') or {}
+            ver = str(data.get('release') or data.get('version') or '')
+            # release shapes: "9.2-1", "9.2.0", "9.1-13"
+            import re
+            m = re.match(r'(\d+)[.\-](\d+)', ver)
+            if not m:
+                self._pve_version_cache = None
+                return None
+            tup = (int(m.group(1)), int(m.group(2)))
+            self._pve_version_cache = tup
+            return tup
+        except Exception:
+            self._pve_version_cache = None
+            return None
     
     def get_scsi_controllers(self) -> List[Dict]:
         
