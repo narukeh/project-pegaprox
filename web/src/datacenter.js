@@ -5496,7 +5496,7 @@
                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                     <div className="flex items-center justify-between mb-2">
                                         <h3 className="font-semibold flex items-center gap-2">
-                                            <Icons.Sliders className="w-4 h-4" />
+                                            <Icons.Activity className="w-4 h-4" />
                                             CRS &amp; Auto-Rebalance
                                             <span className="text-[11px] text-gray-500 font-normal">(same config as Datacenter → Options)</span>
                                         </h3>
