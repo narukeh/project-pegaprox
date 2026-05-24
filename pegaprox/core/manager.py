@@ -8045,10 +8045,18 @@ echo "AGENT_INSTALLED_OK"
                 url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/clone"
             
             data = {'newid': newid}
-            
+
+            # MK May 2026 (#448 @DarmokNoob) — PVE LXC clone schema doesn't
+            # accept `name=`, it wants `hostname=` (verified via pvesh).
+            # QEMU clone schema is the other way around. The xcrepl + repl
+            # paths in api/vms.py have the same bug fixed in the same commit;
+            # this is the manual-clone-from-UI path.
             if name:
-                data['name'] = name
-            
+                if vm_type == 'lxc':
+                    data['hostname'] = name
+                else:
+                    data['name'] = name
+
             if full:
                 data['full'] = 1
             else:

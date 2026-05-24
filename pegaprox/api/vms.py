@@ -5513,11 +5513,16 @@ def _execute_local_replication(job):
         except:
             pass
 
+        # MK May 2026 (#448) — same hostname-vs-name fix as the xcrepl path.
         clone_data = {
             'newid': clone_vmid,
             'full': 1,
-            'name': f'repl-{vmid}-{target_node}',
         }
+        clone_label = f'repl-{vmid}-{target_node}'
+        if vm_type == 'lxc':
+            clone_data['hostname'] = clone_label
+        else:
+            clone_data['name'] = clone_label
         if use_snap_clone:
             clone_data['snapname'] = snap_name
         if target_storage:
@@ -5734,11 +5739,21 @@ def _execute_replication(job):
         except Exception as e:
             logging.debug(f"[XCREPL] Could not detect storage type: {e}")
 
+        # MK May 2026 (#448 @DarmokNoob) — PVE clone schema differs by VM type:
+        # QEMU (`/qemu/{vmid}/clone`) accepts `name=` for the clone label;
+        # LXC  (`/lxc/{vmid}/clone`)  rejects `name=` as "property is not
+        # defined in schema" and wants `hostname=` instead. Confirmed via
+        # pvesh + curl by the reporter. Earlier this function always sent
+        # `name`, so every cross-cluster LXC DR job 400'd at the clone step.
         clone_data = {
             'newid': clone_vmid,
             'full': 1,
-            'name': f'xcrepl-{vmid}-tmp',
         }
+        clone_label = f'xcrepl-{vmid}-tmp'
+        if vm_type == 'lxc':
+            clone_data['hostname'] = clone_label
+        else:
+            clone_data['name'] = clone_label
         if use_snap_clone:
             clone_data['snapname'] = snap_name
 
