@@ -1,15 +1,13 @@
 name: Build Release Appliances (VM + LXC)
 
 on:
-  # TEST: läuft automatisch bei jedem Push in testing. Nach dem Entwickeln entfernen.
-  push:
-    branches: [testing]
   release:
     types: [published]
+  # Für manuelles Nachbauen eines bestehenden Releases:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release-Tag (z. B. v0.9.11), nur für manuelle Läufe"
+        description: "Release-Tag (z. B. v0.9.11)"
         required: false
         default: ""
 
@@ -19,42 +17,37 @@ permissions:
 env:
   PVE_PORT: "5000"
   DEBIAN_RELEASE: "trixie"
-  APT_POLL_RETRIES: "40"     # 40 x 30s = max. 20 Minuten
+  APT_POLL_RETRIES: "120"     # 120 x 30s = max. 60 Minuten
   APT_POLL_INTERVAL: "30"
 
 jobs:
   # ----------------------------------------------------------------------
-  # 1) Version ermitteln + warten bis Paket im gyptazy-Repo verfügbar ist
+  # 1) Version ermitteln + warten bis Release-Paket im gyptazy-Repo ist
   # ----------------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
-      aptver:  ${{ steps.poll.outputs.aptver }}
     steps:
       - id: ver
+        name: Release-Version ermitteln
         run: |
-          # TEST: feste Version, die garantiert schon im gyptazy-Repo liegt.
-          # Zum Live-Betrieb diesen TEST-Block löschen und den darunter aktivieren.
-          echo "version=v0.9.10" >> "$GITHUB_OUTPUT"
-
-          # --- Live-Logik (auskommentiert, bis Testing fertig) ---
-          # if [ -n "${{ github.event.release.tag_name }}" ]; then
-          #   V="${{ github.event.release.tag_name }}"
-          # elif [ -n "${{ inputs.tag }}" ]; then
-          #   V="${{ inputs.tag }}"
-          # else
-          #   V="dev-$(date +%Y%m%d-%H%M%S)"
-          # fi
-          # echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            V="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            V="${{ inputs.tag }}"
+          else
+            V="dev-$(date +%Y%m%d-%H%M%S)"
+          fi
+          echo "Version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y curl gnupg ca-certificates
 
-      - id: poll
-        name: Auf PegaProx-Paket im APT-Repo warten
+      - name: Auf PegaProx-Paket im APT-Repo warten
         run: |
           set -e
           # Key + Sources-Liste lokal im Workspace ablegen (kein /etc, kein sudo nötig)
@@ -96,7 +89,7 @@ jobs:
             echo "::error::Paket für $WANT ist nach dem Timeout nicht im gyptazy-Repo aufgetaucht."
             exit 1
           fi
-          echo "aptver=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "Release-Paket ist verfügbar, Build kann starten."
 
   # ----------------------------------------------------------------------
   # 2) LXC-Template per distrobuilder (Snap) + Smoke-Test
@@ -118,15 +111,13 @@ jobs:
           distrobuilder --version
 
       - name: distrobuilder-Definition schreiben
-        env:
-          APTVER: ${{ needs.prepare.outputs.aptver }}
         run: |
           mkdir -p packaging/lxc
           cat > packaging/lxc/pegaprox-lxc.yaml <<YAML
           image:
             distribution: debian
             release: ${DEBIAN_RELEASE}
-            description: PegaProx LXC Appliance (${APTVER})
+            description: PegaProx LXC Appliance
             architecture: amd64
 
           source:
@@ -177,7 +168,8 @@ jobs:
                 echo "deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main" \\
                   > /etc/apt/sources.list.d/gyptazy.list
                 apt-get update
-                apt-get -y install "pegaprox=${APTVER}"
+                # immer die neueste verfügbare Version
+                apt-get -y install pegaprox
                 systemctl enable pegaprox || true
 
           mappings:
@@ -198,8 +190,6 @@ jobs:
           mkdir -p /tmp/ct/rootfs
           sudo tar -xpJf rootfs.tar.xz -C /tmp/ct/rootfs
 
-          # Container im Hintergrund booten. Ohne --network-veth teilt er sich
-          # das Host-Netzwerk -> PegaProx lauscht auf localhost:5000 des Runners.
           sudo systemd-nspawn -D /tmp/ct/rootfs \
             --machine pegaprox-test \
             --boot \
@@ -209,7 +199,6 @@ jobs:
           echo "Warte auf PegaProx auf Port ${PVE_PORT}..."
           OK=0
           for i in $(seq 1 36); do
-            # erst HTTPS, dann HTTP probieren (je nachdem, was PegaProx spricht)
             if curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1 \
                || curl -fs "http://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
               OK=1; break
@@ -222,7 +211,6 @@ jobs:
           echo "----- Lauschende Ports auf dem Host -----"
           sudo ss -tlnp || true
 
-          # Container sauber herunterfahren
           sudo machinectl poweroff pegaprox-test 2>/dev/null || true
           sleep 3
           sudo machinectl terminate pegaprox-test 2>/dev/null || true
@@ -245,8 +233,8 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 3) VM-Image: Dateien per qemu-nbd direkt einhängen (kein libguestfs,
-  #    kein passt). PegaProx wird beim ERSTEN BOOT per systemd-Unit installiert.
+  # 3) VM-Image: Dateien per qemu-nbd einhängen.
+  #    PegaProx + IP-Tool werden beim ERSTEN BOOT installiert/bereitgestellt.
   # ----------------------------------------------------------------------
   build-vm:
     needs: prepare
@@ -266,13 +254,11 @@ jobs:
             "https://cloud.debian.org/images/cloud/${DEBIAN_RELEASE}/latest/debian-13-genericcloud-amd64.qcow2"
           qemu-img resize pegaprox.qcow2 8G
 
-      - name: Dateien per qemu-nbd einhängen (kein libguestfs, kein passt)
-        env:
-          APTVER: ${{ needs.prepare.outputs.aptver }}
+      - name: Dateien per qemu-nbd einhängen
         run: |
           set -e
 
-          # --- Dateien, die ins Image sollen, auf dem Runner vorbereiten ---
+          # --- gyptazy-Repo-Key + Sourceliste ---
           curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
             -o gyptazy.asc
 
@@ -280,11 +266,12 @@ jobs:
           deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main
           EOF
 
-          cat > install-pegaprox.sh <<EOF
+          # --- First-Boot-Installer: zieht IMMER die neueste Version ---
+          cat > install-pegaprox.sh <<'EOF'
           #!/bin/sh
           set -eu
           apt-get update
-          apt-get -y install pegaprox=${APTVER}
+          apt-get -y install pegaprox
           systemctl enable pegaprox
           systemctl disable pegaprox-firstboot.service || true
           EOF
@@ -305,10 +292,60 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
+          # --- IP-Setup-Skript für die initiale Konfiguration ---
+          cat > pegaprox-setip.sh <<'EOF'
+          #!/bin/sh
+          # pegaprox-setip.sh - Initiale statische IP der Appliance setzen.
+          # Verwendung:
+          #   sudo pegaprox-setip.sh <IP/CIDR> <Gateway> [DNS]
+          # Beispiel:
+          #   sudo pegaprox-setip.sh 192.168.1.50/24 192.168.1.1 192.168.1.1
+          set -eu
+
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "Bitte als root ausfuehren (sudo)."; exit 1
+          fi
+
+          ADDR="${1:-}"; GW="${2:-}"; DNS="${3:-1.1.1.1}"
+          if [ -z "$ADDR" ] || [ -z "$GW" ]; then
+            echo "Usage: $0 <IP/CIDR> <Gateway> [DNS]"
+            echo "  z.B.: $0 192.168.1.50/24 192.168.1.1 192.168.1.1"
+            exit 1
+          fi
+
+          # Aktives Interface bestimmen (Default-Route, sonst erstes en*/eth*)
+          IFACE="${IFACE:-$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')}"
+          if [ -z "$IFACE" ]; then
+            IFACE="$(ls /sys/class/net | grep -E '^(en|eth)' | head -n1)"
+          fi
+          [ -n "$IFACE" ] || { echo "Kein Netzwerk-Interface gefunden."; exit 1; }
+
+          # cloud-init darf das Netz nicht mehr ueberschreiben
+          mkdir -p /etc/cloud/cloud.cfg.d
+          echo "network: {config: disabled}" \
+            > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+
+          mkdir -p /etc/systemd/network
+          cat > /etc/systemd/network/10-pegaprox.network <<NET
+          [Match]
+          Name=$IFACE
+
+          [Network]
+          Address=$ADDR
+          Gateway=$GW
+          DNS=$DNS
+          NET
+
+          systemctl enable systemd-networkd >/dev/null 2>&1 || true
+          systemctl restart systemd-networkd
+
+          echo "Interface $IFACE gesetzt auf $ADDR (Gateway $GW, DNS $DNS)."
+          echo "PegaProx erreichbar unter: https://${ADDR%/*}:5000/"
+          EOF
+
           # --- qcow2 als NBD-Blockgerät einhängen ---
           sudo modprobe nbd max_part=16
           sudo qemu-nbd --connect=/dev/nbd0 pegaprox.qcow2
-          # auf Partitionstabelle warten
           for i in $(seq 1 10); do
             sudo partprobe /dev/nbd0 2>/dev/null || true
             sleep 1
@@ -316,7 +353,7 @@ jobs:
           done
           echo "Partitionen:"; lsblk /dev/nbd0
 
-          # --- Root-Partition finden (die mit /etc/os-release) ---
+          # --- Root-Partition finden ---
           ROOT=""
           for PART in $(ls /dev/nbd0p* 2>/dev/null); do
             sudo mkdir -p /mnt/probe
@@ -339,17 +376,20 @@ jobs:
           sudo mkdir -p /mnt/img/etc/apt/keyrings
           sudo cp gyptazy.asc  /mnt/img/etc/apt/keyrings/gyptazy.asc
           sudo cp gyptazy.list /mnt/img/etc/apt/sources.list.d/gyptazy.list
+
           sudo cp install-pegaprox.sh /mnt/img/usr/local/sbin/install-pegaprox.sh
-          sudo chmod 0755 /mnt/img/usr/local/sbin/install-pegaprox.sh
+          sudo cp pegaprox-setip.sh   /mnt/img/usr/local/sbin/pegaprox-setip.sh
+          sudo chmod 0755 /mnt/img/usr/local/sbin/install-pegaprox.sh \
+                          /mnt/img/usr/local/sbin/pegaprox-setip.sh
+
           sudo cp pegaprox-firstboot.service \
             /mnt/img/etc/systemd/system/pegaprox-firstboot.service
 
-          # --- Services aktivieren = Symlinks setzen (kein chroot/systemctl nötig) ---
+          # --- Services aktivieren (Symlinks, kein chroot nötig) ---
           sudo mkdir -p /mnt/img/etc/systemd/system/multi-user.target.wants
           sudo ln -sf /etc/systemd/system/pegaprox-firstboot.service \
             /mnt/img/etc/systemd/system/multi-user.target.wants/pegaprox-firstboot.service
 
-          # ssh aktivieren, falls Unit vorhanden (Pfad kann ssh.service oder sshd.service sein)
           for U in ssh.service sshd.service; do
             if [ -f "/mnt/img/lib/systemd/system/$U" ] || [ -f "/mnt/img/usr/lib/systemd/system/$U" ]; then
               SRC="/lib/systemd/system/$U"
@@ -361,8 +401,6 @@ jobs:
           done
 
           sudo sync
-
-          # --- sauber aushängen ---
           sudo umount /mnt/img
           sudo qemu-nbd --disconnect /dev/nbd0
           echo "Image-Bearbeitung abgeschlossen."
@@ -415,73 +453,11 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 4) OPTIONAL: Echtes vzdump-Backup auf self-hosted Proxmox-Node
-  #    Läuft nur, wenn ein Runner mit Labels [self-hosted, proxmox] da ist.
-  # ----------------------------------------------------------------------
-  build-vzdump:
-    needs: [prepare, build-vm]
-    runs-on: [self-hosted, proxmox]
-    continue-on-error: true
-    steps:
-      - name: VM-qcow2 holen
-        uses: actions/download-artifact@v4
-        with:
-          name: vm-image
-          path: .
-
-      - name: VM importieren, testen und als vzdump exportieren
-        env:
-          VMID: "9000"
-          STORAGE: "local-lvm"
-          DUMP_STORAGE: "local"
-        run: |
-          set -e
-          QCOW="$(ls pegaprox-*-vm-amd64.qcow2 | head -n1)"
-          VER="${{ needs.prepare.outputs.version }}"
-
-          qm stop "$VMID" 2>/dev/null || true
-          qm destroy "$VMID" --purge 2>/dev/null || true
-
-          qm create "$VMID" --name "pegaprox-build-$VER" \
-            --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
-            --scsihw virtio-scsi-single --ostype l26 --agent 1
-          qm importdisk "$VMID" "$QCOW" "$STORAGE"
-          qm set "$VMID" --scsi0 "${STORAGE}:vm-${VMID}-disk-0"
-          qm set "$VMID" --boot order=scsi0
-          qm set "$VMID" --ciuser pegaprox --cipassword pegaprox --ipconfig0 ip=dhcp
-          qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
-
-          qm start "$VMID"
-          echo "Warte auf Guest-Agent / Boot..."
-          OK=0
-          for i in $(seq 1 60); do
-            if qm guest cmd "$VMID" ping >/dev/null 2>&1; then OK=1; break; fi
-            sleep 5
-          done
-          [ "$OK" -eq 1 ] || { echo "::error::vzdump-VM bootete nicht"; qm stop "$VMID" || true; exit 1; }
-
-          qm shutdown "$VMID" --timeout 120 || qm stop "$VMID"
-          vzdump "$VMID" --storage "$DUMP_STORAGE" --mode stop --compress zstd
-
-          DUMP_DIR="/var/lib/vz/dump"
-          LATEST="$(ls -t ${DUMP_DIR}/vzdump-qemu-${VMID}-*.vma.zst | head -n1)"
-          cp "$LATEST" "pegaprox-${VER}-vzdump.vma.zst"
-
-          qm destroy "$VMID" --purge
-
-      - name: vzdump sichern
-        uses: actions/upload-artifact@v4
-        with:
-          name: vzdump-backup
-          path: pegaprox-*-vzdump.vma.zst
-          retention-days: 7
-
-  # ----------------------------------------------------------------------
-  # 5) Alles an den Release anhängen (nur bei echtem Release-Event)
+  # 4) Alles an den Release anhängen
   # ----------------------------------------------------------------------
   publish:
-    needs: [prepare, build-lxc, build-vm, build-vzdump]
-    if: ${{ always() && github.event_name == 'release' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
+    needs: [prepare, build-lxc, build-vm]
+    if: ${{ always() && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -491,7 +467,7 @@ jobs:
       - name: Checksums erzeugen
         run: |
           cd dist
-          find . -type f \( -name '*.qcow2' -o -name '*.tar.xz' -o -name '*.vma.zst' \) \
+          find . -type f \( -name '*.qcow2' -o -name '*.tar.xz' \) \
             -exec sha256sum {} \; > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -502,5 +478,4 @@ jobs:
           files: |
             dist/**/*.qcow2
             dist/**/*.tar.xz
-            dist/**/*.vma.zst
             dist/SHA256SUMS.txt
