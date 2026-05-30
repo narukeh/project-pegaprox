@@ -1,6 +1,9 @@
 name: Build Release Appliances (VM + LXC)
 
 on:
+  # TEST: läuft automatisch bei jedem Push in testing. Nach dem Entwickeln entfernen.
+  push:
+    branches: [testing]
   release:
     types: [published]
   workflow_dispatch:
@@ -16,7 +19,6 @@ permissions:
 env:
   PVE_PORT: "5000"
   DEBIAN_RELEASE: "trixie"
-  # Wie oft / wie lange auf das APT-Paket gewartet wird
   APT_POLL_RETRIES: "40"     # 40 x 30s = max. 20 Minuten
   APT_POLL_INTERVAL: "30"
 
@@ -32,14 +34,19 @@ jobs:
     steps:
       - id: ver
         run: |
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
-            V="${{ github.event.release.tag_name }}"
-          elif [ -n "${{ inputs.tag }}" ]; then
-            V="${{ inputs.tag }}"
-          else
-            V="dev-$(date +%Y%m%d-%H%M%S)"
-          fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+          # TEST: feste Version, die garantiert schon im gyptazy-Repo liegt.
+          # Zum Live-Betrieb diesen TEST-Block löschen und den darunter aktivieren.
+          echo "version=v0.9.10" >> "$GITHUB_OUTPUT"
+
+          # --- Live-Logik (auskommentiert, bis Testing fertig) ---
+          # if [ -n "${{ github.event.release.tag_name }}" ]; then
+          #   V="${{ github.event.release.tag_name }}"
+          # elif [ -n "${{ inputs.tag }}" ]; then
+          #   V="${{ inputs.tag }}"
+          # else
+          #   V="dev-$(date +%Y%m%d-%H%M%S)"
+          # fi
+          # echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Tools
         run: |
@@ -50,22 +57,31 @@ jobs:
         name: Auf PegaProx-Paket im APT-Repo warten
         run: |
           set -e
-          install -d -m 0755 /etc/apt/keyrings
+          # Key + Sources-Liste lokal im Workspace ablegen (kein /etc, kein sudo nötig)
           curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
-            -o /etc/apt/keyrings/gyptazy.asc
-          echo "deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main" \
-            | sudo tee /etc/apt/sources.list.d/gyptazy.list
+            -o gyptazy.asc
+          mkdir -p apt-root/etc/apt/sources.list.d \
+                   apt-root/etc/apt/keyrings \
+                   apt-root/var/lib/apt/lists/partial \
+                   apt-root/var/cache/apt/archives/partial
+          cp gyptazy.asc apt-root/etc/apt/keyrings/gyptazy.asc
+          echo "deb [signed-by=$(pwd)/apt-root/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main" \
+            > apt-root/etc/apt/sources.list.d/gyptazy.list
 
-          # Tag z. B. "v0.9.11" -> Debian-Version meist "0.9.11"
           WANT="$(echo '${{ steps.ver.outputs.version }}' | sed 's/^v//')"
           echo "Erwarte Paketversion (Präfix): $WANT"
 
+          # apt komplett auf das lokale Verzeichnis umbiegen -> keine Root-Rechte nötig
+          APT_OPTS="-o Dir::Etc::sourcelist=$(pwd)/apt-root/etc/apt/sources.list.d/gyptazy.list \
+                    -o Dir::Etc::sourceparts=- \
+                    -o Dir::Etc::trusted=$(pwd)/apt-root/etc/apt/keyrings/gyptazy.asc \
+                    -o Dir::State::lists=$(pwd)/apt-root/var/lib/apt/lists \
+                    -o Dir::Cache=$(pwd)/apt-root/var/cache/apt"
+
           FOUND=""
           for i in $(seq 1 "${APT_POLL_RETRIES}"); do
-            sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/gyptazy.list" \
-                                -o Dir::Etc::sourceparts="-" >/dev/null 2>&1 || true
-            # Alle verfügbaren Versionen auflisten und nach unserem Tag suchen
-            CAND="$(apt-cache madison pegaprox 2>/dev/null | awk '{print $3}' || true)"
+            apt-get $APT_OPTS update >/dev/null 2>&1 || true
+            CAND="$(apt-cache $APT_OPTS madison pegaprox 2>/dev/null | awk '{print $3}' || true)"
             MATCH="$(echo "$CAND" | grep -E "^${WANT}([.+~-]|$)" | head -n1 || true)"
             if [ -n "$MATCH" ]; then
               FOUND="$MATCH"
@@ -195,7 +211,6 @@ jobs:
         run: |
           mv rootfs.tar.xz \
             "pegaprox-${{ needs.prepare.outputs.version }}-lxc-amd64.tar.xz"
-          # versionslose Kopie für latest-Download-Alias
           cp "pegaprox-${{ needs.prepare.outputs.version }}-lxc-amd64.tar.xz" \
              "pegaprox-lxc-amd64.tar.xz"
 
@@ -291,12 +306,11 @@ jobs:
 
   # ----------------------------------------------------------------------
   # 4) OPTIONAL: Echtes vzdump-Backup auf self-hosted Proxmox-Node
-  #    Aktiviert sich nur, wenn ein Runner mit Label 'proxmox' existiert.
+  #    Läuft nur, wenn ein Runner mit Labels [self-hosted, proxmox] da ist.
   # ----------------------------------------------------------------------
   build-vzdump:
     needs: [prepare, build-vm]
     runs-on: [self-hosted, proxmox]
-    # Falls kein solcher Runner da ist, läuft der Job einfach nicht an.
     continue-on-error: true
     steps:
       - name: VM-qcow2 holen
@@ -307,19 +321,17 @@ jobs:
 
       - name: VM importieren, testen und als vzdump exportieren
         env:
-          VMID: "9000"            # freie Test-VMID auf der Node
-          STORAGE: "local-lvm"    # Ziel-Storage für die Disk
-          DUMP_STORAGE: "local"   # Storage mit 'Backup'-Content für vzdump
+          VMID: "9000"
+          STORAGE: "local-lvm"
+          DUMP_STORAGE: "local"
         run: |
           set -e
           QCOW="$(ls pegaprox-*-vm-amd64.qcow2 | head -n1)"
           VER="${{ needs.prepare.outputs.version }}"
 
-          # Aufräumen, falls Test-VMID belegt
           qm stop "$VMID" 2>/dev/null || true
           qm destroy "$VMID" --purge 2>/dev/null || true
 
-          # VM anlegen + Disk importieren
           qm create "$VMID" --name "pegaprox-build-$VER" \
             --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0 \
             --scsihw virtio-scsi-single --ostype l26 --agent 1
@@ -329,7 +341,6 @@ jobs:
           qm set "$VMID" --ciuser pegaprox --cipassword pegaprox --ipconfig0 ip=dhcp
           qm set "$VMID" --ide2 "${STORAGE}:cloudinit"
 
-          # Boot-Test
           qm start "$VMID"
           echo "Warte auf Guest-Agent / Boot..."
           OK=0
@@ -339,16 +350,13 @@ jobs:
           done
           [ "$OK" -eq 1 ] || { echo "::error::vzdump-VM bootete nicht"; qm stop "$VMID" || true; exit 1; }
 
-          # Sauber herunterfahren und vzdump erzeugen
           qm shutdown "$VMID" --timeout 120 || qm stop "$VMID"
           vzdump "$VMID" --storage "$DUMP_STORAGE" --mode stop --compress zstd
 
-          # Neuestes Backup-File finden und umbenennen
           DUMP_DIR="/var/lib/vz/dump"
           LATEST="$(ls -t ${DUMP_DIR}/vzdump-qemu-${VMID}-*.vma.zst | head -n1)"
           cp "$LATEST" "pegaprox-${VER}-vzdump.vma.zst"
 
-          # Test-VM entfernen
           qm destroy "$VMID" --purge
 
       - name: vzdump sichern
@@ -363,7 +371,6 @@ jobs:
   # ----------------------------------------------------------------------
   publish:
     needs: [prepare, build-lxc, build-vm, build-vzdump]
-    # vzdump ist optional -> nicht blockieren, wenn der Job übersprungen wurde
     if: ${{ always() && github.event_name == 'release' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
