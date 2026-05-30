@@ -99,7 +99,7 @@ jobs:
           echo "aptver=$FOUND" >> "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------------
-  # 2) LXC-Template per distrobuilder (gepinnte Version) + Smoke-Test
+  # 2) LXC-Template per distrobuilder (Snap) + Smoke-Test
   # ----------------------------------------------------------------------
   build-lxc:
     needs: prepare
@@ -111,8 +111,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            distrobuilder debootstrap rsync \
-            systemd-container curl xz-utils
+            debootstrap rsync systemd-container curl xz-utils
+          # distrobuilder liegt NICHT in apt -> per Snap installieren
+          sudo snap install distrobuilder --classic
+          export PATH="$PATH:/snap/bin"
+          distrobuilder --version
 
       - name: distrobuilder-Definition schreiben
         env:
@@ -183,7 +186,9 @@ jobs:
 
       - name: rootfs bauen
         run: |
-          sudo distrobuilder build-lxc packaging/lxc/pegaprox-lxc.yaml \
+          export PATH="$PATH:/snap/bin"
+          sudo --preserve-env=PATH "$(command -v distrobuilder)" \
+            build-lxc packaging/lxc/pegaprox-lxc.yaml \
             -o image.release=${DEBIAN_RELEASE}
           ls -lh *.tar.xz
 
@@ -222,7 +227,8 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 3) VM-Image via libguestfs (gepinnte Version) + Smoke-Test
+  # 3) VM-Image: virt-customize fasst NUR das Dateisystem an (kein Gast-Netz,
+  #    kein passt). PegaProx wird beim ERSTEN BOOT per cloud-init installiert.
   # ----------------------------------------------------------------------
   build-vm:
     needs: prepare
@@ -235,7 +241,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libguestfs-tools qemu-system-x86 qemu-utils \
-            cloud-image-utils curl
+            cloud-image-utils curl passt
           sudo chmod 0644 /boot/vmlinuz-* || true
 
       - name: Debian Cloud-Image laden
@@ -244,21 +250,63 @@ jobs:
             "https://cloud.debian.org/images/cloud/${DEBIAN_RELEASE}/latest/debian-13-genericcloud-amd64.qcow2"
           qemu-img resize pegaprox.qcow2 8G
 
-      - name: PegaProx ins Image installieren
+      - name: Repo-Konfig + Install-Skript ins Image legen (OHNE Gast-Netz)
         env:
+          # 'direct' = ohne libvirt; SLIRP statt passt als zusätzliche Absicherung
           LIBGUESTFS_BACKEND: direct
+          LIBGUESTFS_BACKEND_SETTINGS: network
           APTVER: ${{ needs.prepare.outputs.aptver }}
         run: |
+          set -e
+          # gyptazy-Repo-Key holen wir auf dem RUNNER (hat Netz), legen ihn als Datei ab
+          curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
+            -o gyptazy.asc
+
+          # Sources-Liste vorbereiten
+          cat > gyptazy.list <<EOF
+          deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main
+          EOF
+
+          # First-Boot-Installer: läuft EINMAL in der VM, wenn die VM Netz hat
+          cat > install-pegaprox.sh <<EOF
+          #!/bin/sh
+          set -eu
+          apt-get update
+          apt-get -y install pegaprox=${APTVER}
+          systemctl enable pegaprox
+          # sich selbst deaktivieren, damit es nur einmal läuft
+          systemctl disable pegaprox-firstboot.service || true
+          EOF
+
+          # systemd-Unit, die den Installer beim ersten Boot nach Netz ausführt
+          cat > pegaprox-firstboot.service <<'EOF'
+          [Unit]
+          Description=PegaProx First Boot Installer
+          After=network-online.target
+          Wants=network-online.target
+          ConditionPathExists=/usr/local/sbin/install-pegaprox.sh
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/install-pegaprox.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # NUR Dateisystem-Operationen -> kein Gast-Networking, kein passt
           sudo -E virt-customize -a pegaprox.qcow2 \
-            --install curl,ca-certificates,gnupg,python3,python3-pip \
-            --run-command 'install -d -m 0755 /etc/apt/keyrings' \
-            --run-command 'curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key -o /etc/apt/keyrings/gyptazy.asc' \
-            --run-command "echo 'deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main' > /etc/apt/sources.list.d/gyptazy.list" \
-            --run-command "apt-get update && apt-get -y install pegaprox=${APTVER}" \
-            --run-command 'systemctl enable pegaprox' \
+            --mkdir /etc/apt/keyrings \
+            --upload gyptazy.asc:/etc/apt/keyrings/gyptazy.asc \
+            --upload gyptazy.list:/etc/apt/sources.list.d/gyptazy.list \
+            --upload install-pegaprox.sh:/usr/local/sbin/install-pegaprox.sh \
+            --chmod 0755:/usr/local/sbin/install-pegaprox.sh \
+            --upload pegaprox-firstboot.service:/etc/systemd/system/pegaprox-firstboot.service \
+            --run-command 'systemctl enable pegaprox-firstboot.service' \
             --run-command 'systemctl enable ssh || true'
 
-      - name: Smoke-Test (VM booten + HTTP-Check)
+      - name: Smoke-Test (VM booten + First-Boot-Install + HTTP-Check)
         run: |
           set -e
           cat > user-data <<'EOF'
@@ -278,9 +326,9 @@ jobs:
             -device virtio-net-pci,netdev=n0 \
             -display none -daemonize -pidfile qemu.pid
 
-          echo "Warte auf PegaProx in der VM (max. 5 min)..."
+          echo "Warte auf PegaProx in der VM (First-Boot-Install kann dauern, max. 8 min)..."
           OK=0
-          for i in $(seq 1 60); do
+          for i in $(seq 1 96); do
             if curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
               OK=1; break
             fi
