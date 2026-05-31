@@ -20,12 +20,24 @@ env:
   APT_POLL_RETRIES: "40"     # 40 x 30s = max. 20 Minuten
   APT_POLL_INTERVAL: "30"
 
+# NS 2026-05-31: GitHub hat ubuntu-latest heute von 22.04 auf 24.04 geflippt
+# und damit gleich zwei Sachen mitgerissen — gerade gegen den live runner
+# durchgespielt. Noble (24.04) hat `distrobuilder` aus apt rausgenommen
+# (gibt's nur noch als snap), und libguestfs nutzt jetzt passt fürs Guest-
+# Networking, was auf den hosted Runnern mit `passt exited with status 1`
+# stirbt; dazu ist `/boot/vmlinuz-*` 0600 root:root → direct-backend kann
+# den Host-Kernel nicht lesen. Alle drei hosted Jobs jetzt fix auf
+# ubuntu-24.04 (nicht `latest`), damit der nächste 26.04-Cutover uns nicht
+# nochmal überrumpelt. Die snap-/kernel-/passt-Workarounds hängen in den
+# jeweiligen 'Tools installieren'-Steps. Self-hosted [proxmox] runner ist
+# nicht betroffen.
+
 jobs:
   # ----------------------------------------------------------------------
   # 1) Version ermitteln + warten bis Paket im gyptazy-Repo verfügbar ist
   # ----------------------------------------------------------------------
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.ver.outputs.version }}
       aptver:  ${{ steps.poll.outputs.aptver }}
@@ -98,7 +110,7 @@ jobs:
   # ----------------------------------------------------------------------
   build-lxc:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -106,8 +118,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            distrobuilder debootstrap rsync \
+            debootstrap rsync \
             systemd-container curl xz-utils
+          # NS: Noble hat distrobuilder aus apt geworfen, Canonical shipped
+          # nur noch als snap (classic, läuft eh privileged). Snap selbst
+          # ist auf den hosted Runnern vorinstalliert, also kostet uns das
+          # nix außer einer extra Zeile.
+          sudo snap install distrobuilder --classic
+          # Symlink, damit die spätere `sudo distrobuilder build-lxc`-Zeile
+          # weiter funktioniert ohne PATH-gefummel.
+          sudo ln -sf /snap/bin/distrobuilder /usr/local/bin/distrobuilder
+          distrobuilder --version
 
       - name: distrobuilder-Definition schreiben
         env:
@@ -222,7 +243,7 @@ jobs:
   # ----------------------------------------------------------------------
   build-vm:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -231,8 +252,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libguestfs-tools qemu-system-x86 qemu-utils \
-            cloud-image-utils curl
+            cloud-image-utils curl \
+            passt linux-image-virtual
+          # NS: libguestfs direct-backend liest /boot/vmlinuz-$(uname -r) um
+          # die supermin appliance zu bauen — Noble shipped das 0600
+          # root:root, dem nicht-root runner-user fliegt's um die Ohren.
           sudo chmod 0644 /boot/vmlinuz-* || true
+          # NS: nur diagnostisch — surfaced backend-/appliance-Probleme im
+          # Job-Log, ohne den Step zu killen. Hilft beim nächsten passt-/
+          # supermin-Regress.
+          sudo libguestfs-test-tool 2>&1 | tail -20 || true
 
       - name: Debian Cloud-Image laden + Checksum verifizieren
         run: |
@@ -403,7 +432,7 @@ jobs:
     needs: [prepare, build-lxc, build-vm, build-vzdump]
     # vzdump ist optional -> nicht blockieren, wenn der Job übersprungen wurde
     if: ${{ always() && github.event_name == 'release' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
