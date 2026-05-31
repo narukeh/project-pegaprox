@@ -77,14 +77,8 @@ def load_custom_roles() -> dict:
         return {'global': global_roles, 'tenants': tenant_roles}
     except Exception as e:
         logging.error(f"Error loading custom roles from database: {e}")
-        # Legacy fallback
-        if os.path.exists(CUSTOM_ROLES_FILE):
-            try:
-                with open(CUSTOM_ROLES_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-    
+        # NS May 2026 - plain-JSON CUSTOM_ROLES_FILE fallback removed (encrypted DB only).
+
     return {'global': {}, 'tenants': {}}
 
 
@@ -204,14 +198,8 @@ def load_tenants() -> dict:
             return {t['id']: t for t in tenants_list}
     except Exception as e:
         logging.error(f"Error loading tenants from database: {e}")
-        # Legacy fallback
-        if os.path.exists(TENANTS_FILE):
-            try:
-                with open(TENANTS_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-    
+        # NS May 2026 - plain-JSON TENANTS_FILE fallback removed (encrypted DB only).
+
     # Create default tenant
     default = {
         DEFAULT_TENANT_ID: {
@@ -711,6 +699,63 @@ def get_user_vms(user: dict, cluster_id: str) -> list:
             allowed_vms.append(int(vmid))
     
     return allowed_vms if allowed_vms else None
+
+
+# =============================================================================
+# VMWARE VM-LEVEL ACCESS CONTROL
+# Similar to Proxmox VM ACLs but for VMware VMs
+# Security fix: Prevent unauthorized VM operations
+# =============================================================================
+
+def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission: str = 'vmware.vm.view') -> bool:
+    """Check if user can access a specific VMware VM
+    
+    Security fix for authorization bypass vulnerability.
+    Implements VM-level authorization for VMware VMs similar to Proxmox.
+    
+    Logic:
+    1. Admin always has access
+    2. If user has VM-specific ACL entry for this VMware server:
+       - inherit_role=True: User can do ALL VM operations (full access)
+       - inherit_role=False: User can ONLY do operations listed in permissions
+    3. If user not in ACL: fall back to user's general role permissions
+    
+    Args:
+        user: User dict with username and role
+        vmware_id: VMware server ID
+        vm_id: VM identifier (string)
+        permission: Required permission (e.g., 'vmware.vm.power', 'vmware.vm.view')
+    
+    Returns:
+        bool: True if user has access, False otherwise
+    """
+    if user.get('role') == ROLE_ADMIN:
+        return True
+    
+    username = user.get('username', '')
+    acls = get_vm_acls()
+    
+    # VMware ACLs are stored under vmware_id as the cluster key
+    vmware_acls = acls.get(f'vmware:{vmware_id}', {})
+    vm_acl = vmware_acls.get(str(vm_id), {})
+    
+    if vm_acl:
+        allowed_users = vm_acl.get('users', [])
+        
+        # If user is in the ACL whitelist, check their ACL permissions
+        if username in allowed_users or '*' in allowed_users:
+            if vm_acl.get('inherit_role', True):
+                # inherit_role=True: FULL VM access
+                vmware_permissions = ['vmware.vm.view', 'vmware.vm.power', 'vmware.vm.manage', 
+                                     'vmware.vm.snapshot', 'vmware.vm.migrate', 'vmware.vm.console']
+                return permission in vmware_permissions
+            else:
+                # inherit_role=False: use ONLY the VM-specific permissions
+                vm_perms = vm_acl.get('permissions', [])
+                return permission in vm_perms
+    
+    # No VM-specific ACL - use general permissions
+    return has_permission(user, permission)
 
 
 # =============================================================================

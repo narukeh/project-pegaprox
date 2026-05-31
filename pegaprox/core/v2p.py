@@ -18,6 +18,7 @@ from datetime import datetime
 from pegaprox.globals import cluster_managers, vmware_managers, _v2p_migrations
 from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
 from pegaprox.utils.realtime import broadcast_sse
+from pegaprox.utils.audit import log_audit
 
 class V2PMigrationTask:
     """Tracks VMware -> Proxmox migration through all phases.
@@ -158,6 +159,19 @@ class V2PMigrationTask:
         # hit a terminal phase. No more SSH calls happen after these phases.
         if phase in ('completed', 'failed'):
             self._scrub_credentials()
+        # MK May 2026 (audit completeness) — emit terminal-phase audit event so the
+        # support-bundle audit_log captures the outcome of every v2p run, not just
+        # the start. Closes the diagnostic-loop gap that #438 surfaced (audit only
+        # showed `vmware.migration.started` with no follow-up, forcing log archaeology).
+        if phase in ('completed', 'failed'):
+            try:
+                detail = f"VM '{self.vm_name or self.vm_id}' → VMID {getattr(self, 'proxmox_vmid', '?')}"
+                if phase == 'failed':
+                    detail += f" — {error or self.error or 'no detail'}"
+                log_audit('system', f'vmware.migration.{phase}', detail,
+                          cluster=str(self.target_cluster) if self.target_cluster else None)
+            except Exception:
+                pass
         self.log(f"Phase: {phase}")
         # Broadcast migration status change via SSE
         try:
@@ -639,7 +653,7 @@ def _run_v2p_migration(task):
 
         # Resolve tmpdir on target storage so qemu-img/importdisk don't fill root
         rc_tp, tmpdir_out, _ = _pve_node_exec(pve_mgr, task.target_node,
-            f"dir=$(pvesm path {task.target_storage}:1 2>/dev/null | xargs dirname 2>/dev/null) && "
+            f"dir=$(pvesm path {shlex.quote(task.target_storage)}:1 2>/dev/null | xargs dirname 2>/dev/null) && "
             f"[ -d \"$dir\" ] && echo $dir || echo /var/tmp",
             timeout=10)
         v2p_tmpdir = str(tmpdir_out or '').strip() or '/var/tmp'
@@ -868,7 +882,7 @@ def _run_v2p_migration(task):
                     pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
                     pre_keys = pending.get('pre_enrolled_keys', '1')
                     _pve_node_exec(pve_mgr, task.target_node,
-                        f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                        f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                         timeout=15)
                 _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
                 _register_uefi_fallback_loader(pve_mgr, task)
@@ -1026,7 +1040,7 @@ def _run_v2p_migration(task):
                 pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
                 pre_keys = pending.get('pre_enrolled_keys', '1')
                 _pve_node_exec(pve_mgr, task.target_node,
-                    f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                    f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                     timeout=15)
                 task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
 
@@ -1217,7 +1231,7 @@ def _run_v2p_migration(task):
                     pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
                     pre_keys = pending.get('pre_enrolled_keys', '1')
                     _pve_node_exec(pve_mgr, task.target_node,
-                        f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                        f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                         timeout=15)
                 _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, len(descriptor_files))
                 _register_uefi_fallback_loader(pve_mgr, task)
@@ -1369,7 +1383,7 @@ def _run_v2p_migration(task):
             pending = getattr(task, '_pending_efidisk', None) or {'efitype': '4m', 'pre_enrolled_keys': '1'}
             pre_keys = pending.get('pre_enrolled_keys', '1')
             _pve_node_exec(pve_mgr, task.target_node,
-                f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                 timeout=15)
             task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
 
@@ -3260,7 +3274,7 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
         if not vol_id or not dev_path:
             # NS Mar 2026 - #132: surface the actual pvesm error so user can debug
             rc_dbg, out_dbg, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"pvesm alloc {task.target_storage} {task.proxmox_vmid} vm-{task.proxmox_vmid}-disk-{di} 1G 2>&1",
+                f"pvesm alloc {shlex.quote(task.target_storage)} {task.proxmox_vmid} vm-{task.proxmox_vmid}-disk-{di} 1G 2>&1",
                 timeout=10)
             task.log(f"  Disk allocation failed for disk {di}")
             task.log(f"  Storage: {task.target_storage}, VMID: {task.proxmox_vmid}")
@@ -4901,7 +4915,7 @@ exit $((S + R))
                           or str(getattr(task, 'ostype', '') or '').lower().startswith('win')
                 pre_keys = '1' if _is_win else '0'
                 _pve_node_exec(pve_mgr, task.target_node,
-                    f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                    f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                     timeout=15)
                 task.log(f"  EFI disk allocated (pre-enrolled-keys={pre_keys})")
             try:
@@ -4976,7 +4990,46 @@ exit $((S + R))
         _pve_node_exec(pve_mgr, task.target_node, "sync", timeout=10)
     else:
         task.log("Configuring VM with local disks...")
-    
+
+        # MK May 2026 (#438 @crcro) — drive_mirror -n live-pivots QEMU's runtime
+        # view to the local disk but DOES NOT update the persistent VM config.
+        # Without this block, the post-migration config still references the old
+        # sshfs source and the new scsi0:<local-vol-id> never gets written. The
+        # VM keeps running off the in-memory pivot just fine, but a reboot
+        # finds no disk in config and won't boot. Reporter saw exactly this:
+        # VM works post-migration, restart loses disks, .raw/.qcow2 left orphaned.
+        try:
+            # 1) clean stale args/boot/unused/old-scsi sshfs entries from config
+            _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^args:/d' {conf_path}", timeout=5)
+            _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^boot:/d' {conf_path}", timeout=5)
+            _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^unused/d' {conf_path}", timeout=5)
+            for di in range(len(descriptor_files)):
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"sed -i '/^{disk_bus}{di}:/d' {conf_path}", timeout=5)
+
+            # 2) write the local vol_id refs the live-pivot mirrored to
+            attached_count = 0
+            for di in range(len(descriptor_files)):
+                vol_id = local_volumes[di][0] if di < len(local_volumes) else ''
+                if not vol_id:
+                    task.log(f"  WARNING: post-pivot no volume for disk {di} — skipping")
+                    continue
+                rc_at, out_at, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"qm set {task.proxmox_vmid} --{disk_bus}{di} {vol_id} 2>&1", timeout=15)
+                at_out = str(out_at or '').strip()
+                if rc_at == 0 and 'error' not in at_out.lower():
+                    task.log(f"  Disk {di}: {disk_bus}{di} → {vol_id} ✓ (persisted)")
+                    attached_count += 1
+                else:
+                    task.log(f"  WARNING: post-pivot qm set --{disk_bus}{di} {vol_id} failed: {at_out[:150]}")
+
+            # 3) boot order so the next reboot finds the disk
+            _pve_node_exec(pve_mgr, task.target_node,
+                f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=10)
+            task.log(f"  Post-pivot persistent config updated: {attached_count}/{len(descriptor_files)} disk(s) wired, boot order={disk_bus}0")
+        except Exception as e:
+            task.log(f"  WARNING: post-pivot config update failed: {e} — VM runs now but reboot will fail")
+
     if not mirror_success:
         # Clean config: remove SSH args, boot, and unused disk lines
         _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^args:/d' {conf_path}", timeout=5)
@@ -5070,7 +5123,7 @@ exit $((S + R))
 
             if not efi_line:
                 _pve_node_exec(pve_mgr, task.target_node,
-                    f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                    f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                     timeout=15)
                 task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
             task.log(f"  BIOS: ovmf, Machine: q35 ✓")
@@ -5207,7 +5260,7 @@ def _do_offline_qemuimg_copy(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
 
         if not efi_line:
             _pve_node_exec(pve_mgr, task.target_node,
-                f"qm set {task.proxmox_vmid} --efidisk0 {task.target_storage}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
+                f"qm set {task.proxmox_vmid} --efidisk0 {shlex.quote(task.target_storage)}:1,efitype=4m,pre-enrolled-keys={pre_keys} 2>&1",
                 timeout=15)
             task.log(f"  EFI disk allocated (OVMF, pre-enrolled-keys={pre_keys})")
         task.log(f"  BIOS: ovmf, Machine: q35 ✓")
@@ -5378,7 +5431,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     if not vol_id or not vol_path:
         # surface pvesm error for debugging (#132)
         rc_dbg, out_dbg, _ = _pve_node_exec(pve_mgr, task.target_node,
-            f"pvesm status --storage {task.target_storage} 2>&1", timeout=10)
+            f"pvesm status --storage {shlex.quote(task.target_storage)} 2>&1", timeout=10)
         task.log(f"  Disk allocation failed for disk {disk_index}")
         task.log(f"  Storage: {task.target_storage} | pvesm: {str(out_dbg or '').strip()[:200]}")
         return None, None

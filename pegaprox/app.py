@@ -156,6 +156,7 @@ def create_app():
         # session yet to protect.
         _CSRF_EXEMPT = (
             '/api/auth/login',
+            '/api/auth/setup',  # MK May 2026 — first-run wizard, no session yet
             '/api/auth/oidc/authorize',
             '/api/auth/oidc/callback',
             '/api/auth/oidc/config',
@@ -600,7 +601,7 @@ export * from '/static/js/novnc/core/rfb.js';
 
 def main(debug_mode=False):
     """Main entry point - starts PegaProx server."""
-    from pegaprox.utils.auth import load_users, load_sessions, create_default_users
+    from pegaprox.utils.auth import load_users, load_sessions, backfill_initialized_marker, is_initialized
     from pegaprox.utils.audit import load_audit_log
     from pegaprox.core.config import load_config
     from pegaprox.core.pbs import load_pbs_servers
@@ -615,7 +616,7 @@ def main(debug_mode=False):
     from pegaprox.background.cross_cluster_replication import start_cross_cluster_replication_thread
     from pegaprox.background.syslog_server import start_syslog_server
     from pegaprox.api.schedules import start_scheduler as start_actions_scheduler
-    from pegaprox.api.helpers import load_server_settings
+    from pegaprox.api.helpers import load_server_settings, acme_dns_config_from_settings
     from pegaprox.utils.rbac import get_pool_membership_cache
     from pegaprox.constants import AUDIT_RETENTION_DAYS
 
@@ -740,13 +741,18 @@ def main(debug_mode=False):
     load_sessions()
     print(f"Loaded {len(g.active_sessions)} active sessions")
 
-    # Show default credentials hint
-    if len(g.users_db) == 1 and 'pegaprox' in g.users_db:
+    # MK May 2026 — backfill initialized marker for upgrades from pre-setup-wizard
+    # builds (pre-init installs already had users; we just stamp the marker so the
+    # /login path's is_initialized() doesn't fall through to NOT_INITIALIZED).
+    backfill_initialized_marker()
+
+    if not is_initialized():
         print("\n" + "=" * 50)
-        print("DEFAULT LOGIN CREDENTIALS:")
-        print("  Username: pegaprox")
-        print("  Password: admin")
-        print("  Please change the password after first login!")
+        print("FIRST-RUN SETUP REQUIRED")
+        print("  No admin account exists yet — open the PegaProx URL")
+        print("  in a browser to create the first administrator via the")
+        print("  setup wizard. /api/auth/login is disabled until that")
+        print("  is done.")
         print("=" * 50 + "\n")
 
     # Load existing configuration
@@ -860,9 +866,15 @@ def main(debug_mode=False):
                         _ssl = str(Path("/var/lib/pegaprox/ssl"))
                     else:
                         _ssl = str(Path(__file__).resolve().parent.parent / 'ssl')
+                    _challenge_type = _settings.get('acme_challenge_type') or 'http-01'
+                    _dns_provider = _settings.get('acme_dns_provider') or 'manual'
                     renewed = check_and_renew(
                         _settings['domain'], _settings.get('acme_email', ''),
-                        _ssl, staging=_settings.get('acme_staging', False)
+                        _ssl, staging=_settings.get('acme_staging', False),
+                        directory_url=_settings.get('acme_directory_url', ''),
+                        challenge_type=_challenge_type,
+                        dns_provider=_dns_provider,
+                        dns_config=acme_dns_config_from_settings(_settings)
                     )
                     if renewed:
                         logging.info("[ACME] Certificate renewed, restart required for new cert")
@@ -990,8 +1002,24 @@ def main(debug_mode=False):
         print(f"Started additional HTTP -> HTTPS redirect on port {http_redirect_port}")
 
     # Determine workers
+    # MK 2026-05-31 (v2) — auto-scale with CPU, no hardcoded cap.
+    # Two-part fix:
+    #   (1) `workers` was previously just a log-label — _start_gevent_server
+    #       prints "(N greenlets)" but never passed `spawn=Pool(N)` to
+    #       WSGIServer, so the server actually spawned UNLIMITED greenlets.
+    #       Now plumbed through (see _start_gevent_server below).
+    #   (2) Formula changed: `min(cpu_count*2, 16)` capped huge customer
+    #       boxes at 16. `max(8, cpu_count * 4)` gives:
+    #           1c VM:   8 workers
+    #           4c:     16 workers (same as old default)
+    #           8c:     32 workers
+    #           32c:   128 workers
+    #       gevent greenlets are extremely cheap (a few KB stack) so 100s
+    #       per request handler are fine; the I/O-bound workload benefits
+    #       from a generous pool when /health + /vms-backup-status + a
+    #       dashboard refresh all fire at the same time.
     cpu_count = multiprocessing.cpu_count()
-    workers = int(os.environ.get('PEGAPROX_WORKERS', min(cpu_count * 2, 8)))
+    workers = int(os.environ.get('PEGAPROX_WORKERS', max(8, cpu_count * 4)))
 
     print(f"System: {cpu_count} CPU cores detected")
     print(f"Memory optimization: Garbage collection tuned for {workers} workers")
@@ -1470,7 +1498,14 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                     pass
 
     # Server args - add WebSocket handler if available
-    server_kwargs = {'log': None}
+    # MK 2026-05-31 — actually wire `workers` into the request-handler pool.
+    # gevent.pywsgi.WSGIServer defaults to `spawn=None` which spawns an
+    # unlimited greenlet per request. PEGAPROX_WORKERS was a startup-log
+    # label only — never enforced. Now caps the request-handling pool at
+    # `workers`; per-request fanouts (storage scan, PBS scan, SSH calls)
+    # still spawn inside their own request handler.
+    from gevent.pool import Pool as _RequestPool
+    server_kwargs = {'log': None, 'spawn': _RequestPool(workers)}
     if use_websocket_handler and QuietWebSocketHandler:
         server_kwargs['handler_class'] = QuietWebSocketHandler
 

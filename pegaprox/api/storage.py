@@ -18,8 +18,9 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth
+from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
+from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error
 from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
@@ -74,13 +75,7 @@ def load_esxi_config():
         
     except Exception as e:
         logging.debug(f"Loading ESXi config from DB: {e}")
-        # Fallback to JSON for backwards compat
-        try:
-            if os.path.exists(ESXI_CONFIG_FILE):
-                with open(ESXI_CONFIG_FILE, 'r') as f:
-                    esxi_storages = json.load(f)
-        except:
-            esxi_storages = {}
+        # NS May 2026 - plain-JSON ESXI_CONFIG_FILE fallback removed (encrypted DB only).
 
 def save_esxi_config():
     """Save ESXi storage config to SQLite database
@@ -431,13 +426,7 @@ def load_storage_clusters():
                 })
         except Exception as e:
             logging.debug(f"Loading storage clusters from DB: {e}")
-            # Fallback to JSON for backwards compat
-            try:
-                if os.path.exists(STORAGE_CLUSTERS_FILE):
-                    with open(STORAGE_CLUSTERS_FILE, 'r') as f:
-                        storage_clusters_config = json.load(f)
-            except:
-                storage_clusters_config = {}
+            # NS May 2026 - plain-JSON STORAGE_CLUSTERS_FILE fallback removed (encrypted DB only).
 
 def save_storage_clusters():
     """save storage cluster config to sqlite"""
@@ -876,6 +865,19 @@ def execute_storage_migration(cluster_id):
     
     if not all([vmid, disk, target_storage]):
         return jsonify({'error': 'Missing required parameters: vmid, disk, target'}), 400
+    
+    # Security: Verify user has access to the specific VM before allowing disk operations
+    # This prevents users with storage.config + any VM ACL from manipulating arbitrary VMs
+    users = load_users()
+    username = request.session.get('user', '')
+    user = users.get(username, {})
+    user['username'] = username
+    
+    # Require vm.config permission for the specific VM (disk operations are configuration changes)
+    if not user_can_access_vm(user, cluster_id, int(vmid), 'vm.config'):
+        log_audit(username, 'storage_balancing.disk_move_denied', 
+                  f"Denied attempt to move disk {disk} of VM {vmid} (no VM access)")
+        return jsonify({'error': 'Access denied: you do not have permission to modify this VM'}), 403
     
     try:
         host, port = manager.host, manager.api_port
@@ -2249,7 +2251,7 @@ def get_node_storage_identity(cluster_id, node, storage):
             return jsonify({'supported': True, **data})
         return jsonify({'error': resp.text or f'HTTP {resp.status_code}'}), resp.status_code
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/storage/<storage>/download-url', methods=['POST'])
@@ -2510,6 +2512,14 @@ def iso_sync_trigger(cluster_id):
         return jsonify({'error': 'content_type must be iso or vztmpl'}), 400
     if not all([source, storage, filename]):
         return jsonify({'error': 'source_node, storage, filename required'}), 400
+
+    # MK May 2026 (#481 port) — storage name is concatenated into a `pvesm` shell
+    # command downstream. Block anything outside [A-Za-z0-9._-] before the shell
+    # ever sees it.
+    from pegaprox.utils.sanitization import validate_storage_name
+    if not validate_storage_name(storage):
+        return jsonify({'error': 'Invalid storage name. Must be alphanumeric with hyphens, underscores, or dots only.'}), 400
+
     if hasattr(mgr, '_get_syncable_storage'):
         _, storage_err = mgr._get_syncable_storage(source, storage, content_type)
         if storage_err:

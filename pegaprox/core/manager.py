@@ -72,9 +72,12 @@ except ImportError:
     pass
 
 def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
+    # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
+    # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
+    # `is not None` is the right gate.
     if not tasks:
         return []
-    if GEVENT_POOL and GEVENT_AVAILABLE:
+    if GEVENT_POOL is not None and GEVENT_AVAILABLE:
         try:
             greenlets = [GEVENT_POOL.spawn(task) for task in tasks]
             from gevent import joinall
@@ -446,6 +449,23 @@ class PegaProxManager:
                 session.cookies.set('PVEAuthCookie', self._ticket)
             if self._csrf_token:
                 session.headers.update({'CSRFPreventionToken': self._csrf_token})
+
+        # MK May 2026 — default-timeout safety net for the whole codebase.
+        # ~14 callsites in this file (and a handful in api/) used the session
+        # without an explicit timeout=, defaulting to None = wait-forever.
+        # When the PVE cluster goes dark (host unreachable, network partition)
+        # those calls block 30+ seconds on TCP keepalive each and freeze the
+        # UI thread that issued them. Wrapping session.request() to inject a
+        # default applies the safety net to ALL current + future callers
+        # without touching every individual `.get(...)` / `.post(...)`.
+        # Explicit `timeout=N` in callsites still wins — we only fill in
+        # when the caller didn't say.
+        _original_request = session.request
+        def _request_with_default_timeout(method, url, **kwargs):
+            if 'timeout' not in kwargs or kwargs.get('timeout') is None:
+                kwargs['timeout'] = 15  # 15 s is plenty for any PVE API call
+            return _original_request(method, url, **kwargs)
+        session.request = _request_with_default_timeout
         return session
     
     @staticmethod
@@ -1267,7 +1287,11 @@ class PegaProxManager:
                     return (node_name, node, status_data, netio)
                 
                 # parallel if available
-                if GEVENT_AVAILABLE and GEVENT_POOL:
+                # MK 2026-05-31 — paired with run_concurrent helper bugfix;
+                # the same `and GEVENT_POOL` truthy bug used to make this
+                # silently sequential. `is not None` flips it actually
+                # parallel. Callbacks here are pure reads → safe to fan out.
+                if GEVENT_AVAILABLE and GEVENT_POOL is not None:
                     tasks = [lambda n=node: fetch_node_details(n) for node in nodes]
                     results = run_concurrent(tasks, timeout=15.0)
                 else:
@@ -1413,9 +1437,28 @@ class PegaProxManager:
 
                         maintenance_str = " [MAINTENANCE]" if in_maintenance else ""
                         update_str = " [UPDATING]" if is_updating else ""
-                        self.logger.info(f"Node {node_name}: CPU {cpu_percent:.2f}%, RAM {mem_percent:.2f}% ({self._format_bytes(mem_used)}/{self._format_bytes(mem_total)}), Score {score:.2f}, Status: {node['status']}{maintenance_str}{update_str}")
+                        # NS May 2026 — per-node status fires N×poll_interval per cluster
+                        # (5×6×60s on a 6-node setup = ~720 lines/h of routine metrics).
+                        # Demoted to debug so stdout / k8s log collectors don't carry
+                        # this at default verbosity. Still available via --debug or
+                        # PEGAPROX_LOG_LEVEL=DEBUG. (davinkevin PR #510)
+                        self.logger.debug(f"Node {node_name}: CPU {cpu_percent:.2f}%, RAM {mem_percent:.2f}% ({self._format_bytes(mem_used)}/{self._format_bytes(mem_total)}), Score {score:.2f}, Status: {node['status']}{maintenance_str}{update_str}")
                     else:
                         # Node exists but we couldn't get status - might be offline
+                        # MK May 2026 (#484) — keep the maintenance keys populated
+                        # even when status_data is missing. PegaProx's internal
+                        # nodes_in_maintenance dict is the source of truth here;
+                        # if we drop the keys during a reboot the sidebar reads
+                        # undefined and shows "(Offline)" with no maintenance
+                        # indicator while PVE still has the HA flag set — looks
+                        # like a state-drift bug.
+                        in_maintenance = node_name in self.nodes_in_maintenance
+                        maintenance_task = None
+                        maintenance_acknowledged = False
+                        if in_maintenance:
+                            task_obj = self.nodes_in_maintenance[node_name]
+                            maintenance_task = task_obj.to_dict()
+                            maintenance_acknowledged = task_obj.acknowledged
                         node_status[node_name] = {
                             'status': node.get('status', 'unknown'),
                             'cpu_percent': 0,
@@ -1429,12 +1472,26 @@ class PegaProxManager:
                             'netout': 0,
                             'score': 0,
                             'uptime': 0,
+                            'maintenance_mode': in_maintenance,
+                            'maintenance_task': maintenance_task,
+                            'maintenance_acknowledged': maintenance_acknowledged,
                             'offline': node.get('status') != 'online'
                         }
                 
                 # Add offline nodes from HA tracking that weren't in API response
                 for ha_node, ha_data in self.ha_node_status.items():
                     if ha_node not in api_nodes and ha_data.get('status') == 'offline':
+                        # MK May 2026 (#484) — same fix as the offline branch
+                        # above. ha_node_status fallback fires when PVE drops
+                        # the node entirely from /nodes (deeper reboot / corosync
+                        # partition), so this is exactly the path the user hit.
+                        ha_in_maint = ha_node in self.nodes_in_maintenance
+                        ha_maint_task = None
+                        ha_maint_ack = False
+                        if ha_in_maint:
+                            t_obj = self.nodes_in_maintenance[ha_node]
+                            ha_maint_task = t_obj.to_dict()
+                            ha_maint_ack = t_obj.acknowledged
                         node_status[ha_node] = {
                             'status': 'offline',
                             'cpu_percent': 0,
@@ -1448,6 +1505,9 @@ class PegaProxManager:
                             'netout': 0,
                             'score': 0,
                             'uptime': 0,
+                            'maintenance_mode': ha_in_maint,
+                            'maintenance_task': ha_maint_task,
+                            'maintenance_acknowledged': ha_maint_ack,
                             'offline': True,
                             'last_seen': ha_data.get('last_seen').isoformat() if ha_data.get('last_seen') else None
                         }
@@ -1519,6 +1579,16 @@ class PegaProxManager:
         except:
             return []
     
+    # MK May 2026 (#413) — uniform get_vms(node=None) shim so the site-recovery
+    # detection code (and any other caller that loops over manager types) can
+    # treat Proxmox the same as VMware/XCP-NG. Returns the same list shape as
+    # get_vm_resources(); when `node` is given, filters down to that node.
+    def get_vms(self, node=None) -> list:
+        vms = self.get_vm_resources() or []
+        if node is None:
+            return vms
+        return [v for v in vms if v.get('node') == node]
+
     # MK: old version, keeping around just in case
     def get_vm_resources_v1(self) -> list:
         if not self.is_connected: return []
@@ -5483,7 +5553,15 @@ echo "AGENT_INSTALLED_OK"
                 
                 # Read heartbeat content with validation
                 try:
-                    with open(heartbeat_file, 'r') as f:
+                    # MK May 2026 (CodeAnt #507) — confine the read to the cluster-private .pegaprox/
+                    # heartbeat dir. heartbeat_file is built server-side from node + storage_path, but
+                    # if a future refactor lets a node-name expression slip in, realpath/commonpath
+                    # forces any traversal symlink/.. attempt back inside the expected base.
+                    base_real = os.path.realpath(os.path.join(storage_path, '.pegaprox'))
+                    target_real = os.path.realpath(heartbeat_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception('heartbeat path escaped base directory')
+                    with open(target_real, 'r') as f:
                         data = json.load(f)
                     if not isinstance(data, dict):
                         self.logger.warning(f"[HA] Invalid heartbeat format for {node}: expected dict, got {type(data).__name__}")
@@ -5752,8 +5830,13 @@ echo "AGENT_INSTALLED_OK"
                 'action_required': 'STOP_ALL_VMS',
                 'recovery_will_start_after': (datetime.now() + timedelta(seconds=60)).isoformat()
             }
-            
-            with open(poison_file, 'w') as f:
+
+            # MK May 2026 (CodeAnt #507) — confine write to heartbeat_dir.
+            base_real = os.path.realpath(heartbeat_dir)
+            target_real = os.path.realpath(poison_file)
+            if os.path.commonpath([base_real, target_real]) != base_real:
+                raise Exception('poison pill path escaped base directory')
+            with open(target_real, 'w') as f:
                 import json
                 json.dump(poison_data, f)
             
@@ -5820,7 +5903,12 @@ echo "AGENT_INSTALLED_OK"
         while time.time() - start_time < timeout:
             try:
                 if os.path.exists(ack_file):
-                    with open(ack_file, 'r') as f:
+                    # MK May 2026 (CodeAnt #507) — confine ack read to heartbeat_dir.
+                    base_real = os.path.realpath(heartbeat_dir)
+                    target_real = os.path.realpath(ack_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception('ack path escaped base directory')
+                    with open(target_real, 'r') as f:
                         ack_data = json.load(f)
                     
                     if ack_data.get('vms_stopped'):
@@ -5881,14 +5969,19 @@ echo "AGENT_INSTALLED_OK"
                 age = (datetime.now() - mtime).total_seconds()
                 
                 if age < 300:  # Lock valid for 5 minutes
-                    with open(lock_file, 'r') as f:
+                    # MK May 2026 (CodeAnt #507) — confine lock read to heartbeat_dir.
+                    base_real = os.path.realpath(heartbeat_dir)
+                    target_real = os.path.realpath(lock_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception('lock path escaped base directory')
+                    with open(target_real, 'r') as f:
                         import json
                         lock_data = json.load(f)
-                    
+
                     if lock_data.get('holder') != f'pegaprox_{self.id}':
                         self.logger.warning(f"[HA] Recovery lock held by {lock_data.get('holder')}")
                         return False
-            
+
             # Acquire lock
             lock_data = {
                 'timestamp': datetime.now().isoformat(),
@@ -5896,8 +5989,13 @@ echo "AGENT_INSTALLED_OK"
                 'target_node': failed_node,
                 'cluster': self.config.name
             }
-            
-            with open(lock_file, 'w') as f:
+
+            # MK May 2026 (CodeAnt #507) — same gate on the write.
+            base_real = os.path.realpath(heartbeat_dir)
+            target_real = os.path.realpath(lock_file)
+            if os.path.commonpath([base_real, target_real]) != base_real:
+                raise Exception('lock path escaped base directory')
+            with open(target_real, 'w') as f:
                 import json
                 json.dump(lock_data, f)
             
@@ -7886,9 +7984,13 @@ echo "AGENT_INSTALLED_OK"
                     
                     # Try via Proxmox API as fallback
                     try:
-                        # Proxmox has a reboot command via API
+                        # MK May 2026 — was `self.session.post(..., verify=False)` which
+                        # hardcoded the SSL bypass even when the operator configured
+                        # `_ssl_verify=True` on this cluster. Use _create_session()
+                        # so the per-cluster TLS preference is honoured (proper CA
+                        # verification when the user pinned a custom CA bundle).
                         url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node_name}/status"
-                        response = self.session.post(url, data={'command': 'reboot'}, verify=False)
+                        response = self._create_session().post(url, data={'command': 'reboot'})
                         if response.status_code == 200:
                             task.add_output("Reboot initiated via Proxmox API")
                         else:
@@ -8250,31 +8352,46 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': str(e)}
 
     def create_api_token(self, token_name: str = 'pegaprox-migrate') -> Dict[str, Any]:
-        
+        # MK May 2026 (#413 layer 6, blackshocks bundle 20260530_220647):
+        # if a prior Planned/Emergency failover crashed or its _delayed_cleanup
+        # hadn't fired yet, the same token_name is still on target → PVE returns
+        # 400 "Token already exists" and the next failover bails before it ever
+        # touches qmigrate. Pre-delete is the cleanest path — we'd issue the
+        # delete on cleanup anyway, doing it up-front makes the create idempotent.
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
-        
-        try:
-            host = self.host
-            user = self.config.user
-            
-            # Create token without privilege separation (privsep=0)
-            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
+
+        host = self.host
+        user = self.config.user
+        url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
+
+        def _do_create():
             data = {
                 'privsep': 0,  # No privilege separation - token has same permissions as user
                 'expire': 0,   # No expiration (we'll delete it manually)
                 'comment': 'PegaProx temporary migration token'
             }
-            
-            response = self._api_post(url, data=data)
-            
+            return self._api_post(url, data=data)
+
+        try:
+            response = _do_create()
+
+            # Stale token from a previous run? Drop it and retry once.
+            if response.status_code != 200 and 'already exists' in (response.text or '').lower():
+                self.logger.warning(f"[create_api_token] stale '{token_name}' on {host}, dropping + retry")
+                try:
+                    self._api_delete(url)
+                except Exception as _e:
+                    self.logger.debug(f"[create_api_token] pre-delete swallowed: {_e}")
+                response = _do_create()
+
             if response.status_code == 200:
                 result = response.json()
                 token_data = result.get('data', {})
                 token_value = token_data.get('value', '')
                 full_token_id = token_data.get('full-tokenid', f"{user}!{token_name}")
-                
+
                 self.logger.info(f"[OK] Created API token: {full_token_id}")
                 return {
                     'success': True,
@@ -8286,7 +8403,7 @@ echo "AGENT_INSTALLED_OK"
                 error_msg = response.text
                 self.logger.error(f"[ERROR] Failed to create API token: {error_msg}")
                 return {'success': False, 'error': error_msg}
-                
+
         except Exception as e:
             self.logger.error(f"[ERROR] Error creating API token: {e}")
             return {'success': False, 'error': str(e)}
@@ -11276,7 +11393,8 @@ echo "AGENT_INSTALLED_OK"
             ssh = self._ssh_connect(node_ip)
             # use pvesm to get the base path
             subdir = 'template/iso' if content_type == 'iso' else 'template/cache'
-            cmd = f"pvesm path {storage}:{content_type}/dummy.file 2>/dev/null || echo '/var/lib/vz/{subdir}/dummy.file'"
+            # MK May 2026 (#481 port) — shlex.quote on storage to block shell injection
+            cmd = f"pvesm path {shlex.quote(storage)}:{content_type}/dummy.file 2>/dev/null || echo '/var/lib/vz/{subdir}/dummy.file'"
             _, out, _ = ssh.exec_command(cmd, timeout=10)
             out.channel.recv_exit_status()
             full_path = out.read().decode(errors='replace').strip()
@@ -11964,11 +12082,41 @@ echo "AGENT_INSTALLED_OK"
         endpoint after we confirmed via live probe on PVE 9.2.2 that
         /cluster/cpu-models (the supposed 9.2 endpoint per the early research)
         does not exist. The per-node capabilities endpoint is the right place.
+
+        MK 2026-05-30 — output is sorted now: `host` first, then `max`, then
+        alphabetical (case-insensitive). PVE returns the raw enum order which
+        starts host/kvm64/kvm32/qemu64/… and feels arbitrary once vendor models
+        get mixed in. Keeping host pinned at the top because that's the default
+        we set on every new VM and operators expect to find it first.
         """
         live = self._fetch_pve_cpu_types()
-        if live:
-            return live
-        return list(self._STATIC_CPU_TYPES)
+        return self._sort_cpu_types(live if live else list(self._STATIC_CPU_TYPES))
+
+    @staticmethod
+    def _sort_cpu_types(types):
+        """host first, max second, the rest alphabetical (case-insensitive)."""
+        if not types:
+            return []
+        # dedupe preserving first occurrence (live + custom can repeat)
+        seen, ordered = set(), []
+        for t in types:
+            if t and t not in seen:
+                seen.add(t); ordered.append(t)
+        head = []
+        rest = []
+        for t in ordered:
+            if t == 'host':
+                head.insert(0, t)
+            elif t == 'max':
+                head.append(t) if 'host' in head else head.insert(0, t)
+            else:
+                rest.append(t)
+        # MK: 'host' always first if present; 'max' next if present
+        head_sorted = []
+        if 'host' in head: head_sorted.append('host')
+        if 'max' in head: head_sorted.append('max')
+        rest.sort(key=str.casefold)
+        return head_sorted + rest
 
     def _fetch_pve_cpu_types(self) -> List[str]:
         """GET /nodes/{n}/capabilities/qemu/cpu on the first online node. Returns
@@ -12689,6 +12837,232 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
+    def get_node_sensors(self, node: str) -> Dict[str, Any]:
+        # MK May 2026 — bare-metal sensors via `sensors -j` (lm-sensors JSON).
+        # Returns a flattened list of measurements:
+        #   [{chip, label, kind: 'temp'|'fan'|'volt', value, max, crit, alarm}]
+        # On VMs / hosts without lm-sensors installed the command fails or
+        # returns empty — surfaces as graceful empty list.
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'error': 'cluster not connected'}
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {'error': f'no SSH-reachable IP for node {node}'}
+        user = getattr(self.config, 'ssh_user', None) or 'root'
+
+        raw = self._ssh_run_command_output(ip, user, 'sensors -j 2>/dev/null', timeout=8)
+        if not raw or not raw.strip():
+            return {'error': 'sensors command unavailable or empty (lm-sensors not installed?)'}
+
+        import json as _json
+        try:
+            data = _json.loads(raw)
+        except Exception as e:
+            return {'error': f'sensors JSON parse failed: {e}'}
+
+        # Flatten the {chip: {sensor: {temp1_input: X, ...}}} structure.
+        # lm-sensors keys follow `tempN_input`, `tempN_max`, `tempN_crit`, `tempN_alarm`
+        # plus `fanN_input` and `inN_input` (voltage).
+        out = []
+        for chip, blob in (data or {}).items():
+            if not isinstance(blob, dict):
+                continue
+            for label, sub in blob.items():
+                if label == 'Adapter' or not isinstance(sub, dict):
+                    continue
+                # find the *_input key + its siblings
+                input_key = None
+                for k in sub.keys():
+                    if k.endswith('_input'):
+                        input_key = k
+                        break
+                if not input_key:
+                    continue
+                prefix = input_key.rsplit('_', 1)[0]  # "temp1", "fan1", "in0"
+                kind = 'temp' if prefix.startswith('temp') else (
+                       'fan' if prefix.startswith('fan') else (
+                       'volt' if prefix.startswith('in') else 'other'))
+                value = sub.get(input_key)
+                row = {
+                    'chip': chip,
+                    'label': label,
+                    'kind': kind,
+                    'value': value,
+                    'max': sub.get(f'{prefix}_max'),
+                    'crit': sub.get(f'{prefix}_crit'),
+                    'alarm': bool(sub.get(f'{prefix}_alarm') or 0),
+                }
+                out.append(row)
+        return {'sensors': out, 'count': len(out)}
+
+    def get_node_cluster_health(self, node: str) -> Dict[str, Any]:
+        # MK May 2026 — SSH-side cluster health: corosync ring status,
+        # pvecm quorum + per-service uptime. PVE's REST `/cluster/status`
+        # gives the high-level "are we quorate" answer but not ring latency,
+        # service uptime, or per-ring health. operators chasing a flapping
+        # cluster want all three on one page.
+        #
+        # MK 2026-05-31 (F5) — parallelised: 7 SSH calls × 8s timeout used to
+        # serialise into ~56s worst-case blocking on one gevent worker. Now
+        # all 7 run as greenlets via run_concurrent_dict; total wall-time
+        # capped at 12s (timeout below).
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'error': 'cluster not connected'}
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {'error': f'no SSH-reachable IP for node {node}'}
+        user = getattr(self.config, 'ssh_user', None) or 'root'
+
+        from pegaprox.utils.concurrent import run_concurrent_dict
+        import shlex
+
+        # MK 2026-05-31 (D1) — SERVICES is a hardcoded allow-list today but if
+        # this list ever moves into config or runtime-derivation, an attacker
+        # who can write a service-name would have RCE on the PVE node via the
+        # f-string into a shell-evaluated SSH command. shlex.quote() makes the
+        # path future-proof regardless.
+        SERVICES = ['pveproxy', 'pvedaemon', 'pve-cluster', 'corosync', 'pvestatd']
+        tasks = {
+            'cfg':   (lambda: self._ssh_run_command_output(ip, user, 'corosync-cfgtool -s 2>&1', timeout=8)),
+            'pvecm': (lambda: self._ssh_run_command_output(ip, user, 'pvecm status 2>&1', timeout=8)),
+        }
+        for svc in SERVICES:
+            # closure-bind svc explicitly — late-binding bites here otherwise
+            quoted = shlex.quote(svc)
+            tasks[f'svc:{svc}'] = (lambda q=quoted: self._ssh_run_command_output(
+                ip, user,
+                f'systemctl show -p ActiveState,SubState,ActiveEnterTimestamp,Result {q} 2>&1',
+                timeout=8))
+        results = run_concurrent_dict(tasks, timeout=12)
+
+        out = {'corosync': None, 'pvecm': None, 'services': []}
+
+        # corosync-cfgtool -s : ring status
+        cfg = results.get('cfg')
+        if cfg:
+            rings = []
+            cur = None
+            for line in cfg.splitlines():
+                line = line.strip()
+                if not line: continue
+                if line.startswith('LINK ID'):
+                    if cur: rings.append(cur)
+                    cur = {'raw': [line]}
+                    try:
+                        cur['id'] = int(line.split()[2])
+                    except Exception:
+                        pass
+                elif cur is not None:
+                    cur['raw'].append(line)
+                    low = line.lower()
+                    if 'addr' in low and '=' in line:
+                        cur['address'] = line.split('=', 1)[1].strip()
+                    elif 'status' in low and '=' in line:
+                        # MK: corosync-cfgtool uses `key = value`, not colon
+                        cur['status'] = line.split('=', 1)[1].strip()
+                    elif 'nodes' in low and '=' in line:
+                        try: cur['nodes'] = int(line.split('=', 1)[1].strip())
+                        except Exception: pass
+            if cur: rings.append(cur)
+            out['corosync'] = {'rings': rings}
+
+        # pvecm status: quorum + votes (parallel result)
+        pvecm = results.get('pvecm')
+        if pvecm:
+            info = {}
+            for line in pvecm.splitlines():
+                low = line.lower()
+                if 'quorate' in low and ':' in line:
+                    info['quorate'] = line.split(':', 1)[1].strip()
+                elif 'expected votes' in low and ':' in line:
+                    try: info['expected_votes'] = int(line.split(':', 1)[1].strip())
+                    except Exception: pass
+                elif 'total votes' in low and ':' in line:
+                    try: info['total_votes'] = int(line.split(':', 1)[1].strip())
+                    except Exception: pass
+                elif 'highest expected' in low and ':' in line:
+                    try: info['highest_expected'] = int(line.split(':', 1)[1].strip())
+                    except Exception: pass
+                elif 'cluster name' in low and ':' in line:
+                    info['cluster_name'] = line.split(':', 1)[1].strip()
+                elif 'config version' in low and ':' in line:
+                    try: info['config_version'] = int(line.split(':', 1)[1].strip())
+                    except Exception: pass
+                elif 'nodes:' == low.strip() or 'membership information' in low:
+                    pass
+            out['pvecm'] = info
+
+        # systemctl per-service state for the cluster-critical units (parallel results)
+        for svc in SERVICES:
+            out_text = results.get(f'svc:{svc}')
+            row = {'name': svc, 'active': None, 'sub': None, 'since': None, 'result': None}
+            if out_text:
+                for line in out_text.splitlines():
+                    if '=' in line:
+                        k, _, v = line.partition('=')
+                        if k == 'ActiveState': row['active'] = v
+                        elif k == 'SubState': row['sub'] = v
+                        elif k == 'ActiveEnterTimestamp': row['since'] = v
+                        elif k == 'Result': row['result'] = v
+            out['services'].append(row)
+
+        # MK 2026-05-31 — if SSH wasn't reachable, every call returns None
+        # and we used to surface that as 5 question-mark service cards which
+        # is just visual noise. Signal it explicitly so the UI can render a
+        # single "credentials not configured" message instead.
+        out['ssh_unavailable'] = (
+            out['corosync'] is None
+            and out['pvecm'] is None
+            and all(s.get('active') is None for s in out['services'])
+        )
+
+        return out
+
+    def get_node_netstats(self, node: str) -> Dict[str, Any]:
+        # MK May 2026 — per-NIC error/drop counters. PVE API has aggregate
+        # netin/netout in /rrddata but never per-NIC errors, which is the
+        # bit operators actually need when chasing a flapping uplink. We
+        # SSH'd it anyway for syslog so adding /proc/net/dev costs nothing.
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'error': 'cluster not connected'}
+
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {'error': f'no SSH-reachable IP for node {node}'}
+
+        user = getattr(self.config, 'ssh_user', None) or 'root'
+        output = self._ssh_run_command_output(ip, user, 'cat /proc/net/dev', timeout=10)
+        if not output:
+            return {'error': 'SSH read failed (auth, timeout, or empty)'}
+
+        # /proc/net/dev format:
+        #   Inter-|   Receive                                                |  Transmit
+        #    face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+        #     eth0:  1234  5  0  0  ...
+        ifaces = []
+        cols = ['rx_bytes', 'rx_packets', 'rx_errs', 'rx_drop', 'rx_fifo',
+                'rx_frame', 'rx_compressed', 'rx_multicast',
+                'tx_bytes', 'tx_packets', 'tx_errs', 'tx_drop', 'tx_fifo',
+                'tx_colls', 'tx_carrier', 'tx_compressed']
+        for line in output.splitlines():
+            if ':' not in line or 'Inter-' in line or 'face' in line[:6]:
+                continue
+            name, _, rest = line.partition(':')
+            parts = rest.split()
+            if len(parts) < 16:
+                continue
+            row = {'iface': name.strip()}
+            for k, v in zip(cols, parts):
+                try:
+                    row[k] = int(v)
+                except (TypeError, ValueError):
+                    row[k] = 0
+            ifaces.append(row)
+        return {'interfaces': ifaces, 'count': len(ifaces)}
+
     def get_node_lvmthin(self, node: str) -> List[Dict]:
         """Get LVM-Thin pools"""
         if not self.is_connected:
@@ -12934,6 +13308,39 @@ echo "AGENT_INSTALLED_OK"
             
             if response.status_code == 200:
                 return {'success': True, 'message': 'Subscription updated'}
+            return {'success': False, 'error': response.text}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def check_node_subscription(self, node: str, force: bool = False) -> Dict[str, Any]:
+        """Refresh node subscription status"""
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'success': False, 'error': 'Could not connect'}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            data = {'force': 1} if force else {}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {'success': True, 'data': response.json().get('data')}
+            return {'success': False, 'error': response.text}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_node_subscription(self, node: str) -> Dict[str, Any]:
+        """Delete subscription key"""
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {'success': False, 'error': 'Could not connect'}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                return {'success': True, 'message': 'Subscription removed'}
             return {'success': False, 'error': response.text}
         except Exception as e:
             return {'success': False, 'error': str(e)}

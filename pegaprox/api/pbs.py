@@ -12,7 +12,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import safe_error
+from pegaprox.api.helpers import safe_error, check_pbs_access
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
 
 bp = Blueprint('pbs', __name__)
@@ -78,7 +78,11 @@ def add_pbs_server():
     pbs_id = str(uuid.uuid4())[:8]
     
     # Test connection first
-    mgr = PBSManager(pbs_id, data)
+    try:
+        mgr = PBSManager(pbs_id, data)
+    except ValueError as e:
+        return jsonify({'error': 'Invalid PBS host'}), 400
+    
     if not mgr.connect():
         return jsonify({'error': f'Connection failed: {mgr.last_error}'}), 400
     
@@ -106,21 +110,44 @@ def update_pbs_server(pbs_id):
             return jsonify({'error': 'PBS server not found'}), 404
     
     save_pbs_server(pbs_id, data)
-    
+
+    # MK May 2026 (#469 port) — track whether saved-creds are being preserved AND
+    # the host moved at the same time. If yes: don't auto-connect, because the
+    # operation could be a credential-exfil attempt where the user keeps the
+    # password (sent as ********) but points the server at an attacker-controlled
+    # host. We'd otherwise send the real password to that host on connect.
+    credentials_preserved = False
+    host_changed = False
+
     # Recreate manager with new config
     if pbs_id in pbs_managers:
         old_mgr = pbs_managers[pbs_id]
+        if (data.get('host') and data.get('host') != old_mgr.host) or \
+           (data.get('port') and int(data.get('port', 8007)) != old_mgr.port):
+            host_changed = True
         # Preserve credentials if masked
         if data.get('password') == '********':
             data['password'] = old_mgr.password
+            credentials_preserved = True
         if data.get('api_token_secret') == '********':
             data['api_token_secret'] = old_mgr.api_token_secret
+            credentials_preserved = True
         if data.get('ssh_key') == '********':
             data['ssh_key'] = getattr(old_mgr, 'ssh_key', '')
-    
-    mgr = PBSManager(pbs_id, data)
+
+    try:
+        mgr = PBSManager(pbs_id, data)
+    except ValueError as e:
+        return jsonify({'error': 'Invalid PBS host'}), 400
+
     if data.get('enabled', True):
-        mgr.connect()
+        if host_changed and credentials_preserved:
+            # cred-exfil guard — operator must explicitly re-test the new host
+            mgr.connected = False
+            mgr.last_error = 'Host changed — auto-connect skipped for security (preserved credentials). Use Test Connection manually after verifying the new host.'
+            logging.warning(f"[PBS:{mgr.name}] Skipped auto-connect after host change with preserved credentials (cred-exfil guard)")
+        else:
+            mgr.connect()
     pbs_managers[pbs_id] = mgr
     
     log_audit(request.session.get('user', 'admin'), 'pbs.updated', f"Updated PBS server: {data.get('name', pbs_id)}")
@@ -154,7 +181,12 @@ def test_pbs_new_connection():
     data = request.json or {}
     if not data.get('host'):
         return jsonify({'error': 'Host is required'}), 400
-    test_mgr = PBSManager('test', data)
+    
+    try:
+        test_mgr = PBSManager('test', data)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': 'Invalid PBS host'}), 400
+    
     success = test_mgr.connect()
     if success:
         version = test_mgr.get_version()
@@ -175,7 +207,11 @@ def test_pbs_connection(pbs_id):
     
     if data.get('host'):
         # Test with provided credentials (before save)
-        test_mgr = PBSManager('test', data)
+        try:
+            test_mgr = PBSManager('test', data)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': 'Invalid PBS host'}), 400
+        
         success = test_mgr.connect()
         if success:
             version = test_mgr.get_version()
@@ -203,6 +239,11 @@ def test_pbs_connection(pbs_id):
 @require_auth(perms=['pbs.view'])
 def get_pbs_status(pbs_id):
     """Get PBS server status (CPU, RAM, disk, uptime)"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -266,6 +307,11 @@ def refresh_pbs_apt(pbs_id):
 @require_auth(perms=['admin.settings'])
 def start_pbs_update(pbs_id):
     """Start apt-get dist-upgrade on PBS host via SSH"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -321,6 +367,11 @@ def clear_pbs_update_status(pbs_id):
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_datastores(pbs_id):
     """List datastores with detailed status"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -401,6 +452,11 @@ def _pbs_vm_name_lookup(pbs_mgr):
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_snapshots(pbs_id, store):
     """List snapshots in a datastore"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -428,6 +484,11 @@ def get_pbs_snapshots(pbs_id, store):
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_groups(pbs_id, store):
     """List backup groups in a datastore"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -452,6 +513,11 @@ def get_pbs_groups(pbs_id, store):
 @require_auth(perms=['pbs.datastore.gc'])
 def pbs_start_gc(pbs_id, store):
     """Start garbage collection"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -465,6 +531,11 @@ def pbs_start_gc(pbs_id, store):
 @require_auth(perms=['pbs.datastore.verify'])
 def pbs_start_verify(pbs_id, store):
     """Start verification"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -479,6 +550,11 @@ def pbs_start_verify(pbs_id, store):
 @require_auth(perms=['pbs.datastore.prune'])
 def pbs_prune(pbs_id, store):
     """Prune old backups"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -501,6 +577,11 @@ def pbs_prune(pbs_id, store):
 @require_auth(perms=['pbs.snapshot.delete'])
 def pbs_delete_snapshot(pbs_id, store):
     """Delete a specific snapshot"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -572,6 +653,11 @@ def get_pbs_jobs(pbs_id):
 @require_auth(perms=['pbs.jobs.run'])
 def run_pbs_job(pbs_id, job_type, job_id):
     """Manually trigger a PBS job"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -671,6 +757,11 @@ def get_pbs_snapshot_notes(pbs_id, store):
 @require_auth(perms=['pbs.snapshot.notes'])
 def set_pbs_snapshot_notes(pbs_id, store):
     """Set notes for a specific snapshot"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -706,6 +797,11 @@ def get_pbs_group_notes(pbs_id, store):
 @require_auth(perms=['pbs.snapshot.notes'])
 def set_pbs_group_notes(pbs_id, store):
     """Set notes for a backup group"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -726,6 +822,11 @@ def set_pbs_group_notes(pbs_id, store):
 @require_auth(perms=['pbs.snapshot.protect'])
 def set_pbs_snapshot_protected(pbs_id, store):
     """Set protected flag on a snapshot"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -878,6 +979,11 @@ def create_pbs_datastore(pbs_id):
     NS: This creates the datastore config on the PBS. The path must already exist 
     on the PBS filesystem - we can't create directories remotely.
     """
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -930,6 +1036,11 @@ def create_pbs_datastore(pbs_id):
 @require_auth(perms=['pbs.datastore.modify'])
 def update_pbs_datastore_config(pbs_id, store):
     """Update datastore configuration (retention, GC schedule, etc.)"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -977,6 +1088,11 @@ def delete_pbs_datastore(pbs_id, store):
     NS: By default this only removes the config - actual backup data on disk stays.
     This is the safe default. To also destroy data, send keep_data=false (dangerous!).
     """
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1010,6 +1126,11 @@ def delete_pbs_datastore(pbs_id, store):
 @require_auth(perms=['pbs.jobs.create'])
 def create_pbs_job(pbs_id, job_type):
     """Create a new sync/verify/prune job"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1052,6 +1173,11 @@ def create_pbs_job(pbs_id, job_type):
 @require_auth(perms=['pbs.jobs.modify'])
 def update_pbs_job(pbs_id, job_type, job_id):
     """Update a job configuration"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1077,6 +1203,11 @@ def update_pbs_job(pbs_id, job_type, job_id):
 @require_auth(perms=['pbs.jobs.delete'])
 def delete_pbs_job(pbs_id, job_type, job_id):
     """Delete a job"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1103,6 +1234,11 @@ def delete_pbs_job(pbs_id, job_type, job_id):
 @require_auth(perms=['pbs.tasks.stop'])
 def stop_pbs_task(pbs_id, upid):
     """Stop a running PBS task"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1120,6 +1256,11 @@ def stop_pbs_task(pbs_id, upid):
 @require_auth(perms=['pbs.notifications.manage'])
 def create_pbs_notification_target(pbs_id, target_type):
     """Create a notification target (sendmail, gotify, smtp, webhook)"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1138,6 +1279,11 @@ def create_pbs_notification_target(pbs_id, target_type):
 @require_auth(perms=['pbs.notifications.manage'])
 def update_pbs_notification_target(pbs_id, target_type, name):
     """Update a notification target"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1151,6 +1297,11 @@ def update_pbs_notification_target(pbs_id, target_type, name):
 @require_auth(perms=['pbs.notifications.manage'])
 def delete_pbs_notification_target(pbs_id, target_type, name):
     """Delete a notification target"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     result = pbs_managers[pbs_id].delete_notification_target(target_type, name)
@@ -1165,6 +1316,11 @@ def delete_pbs_notification_target(pbs_id, target_type, name):
 @require_auth(perms=['pbs.notifications.manage'])
 def create_pbs_notification_matcher(pbs_id):
     """Create a notification matcher"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1181,6 +1337,11 @@ def create_pbs_notification_matcher(pbs_id):
 @require_auth(perms=['pbs.notifications.manage'])
 def update_pbs_notification_matcher(pbs_id, name):
     """Update a notification matcher"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1194,6 +1355,11 @@ def update_pbs_notification_matcher(pbs_id, name):
 @require_auth(perms=['pbs.notifications.manage'])
 def delete_pbs_notification_matcher(pbs_id, name):
     """Delete a notification matcher"""
+    # Check PBS access authorization
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     result = pbs_managers[pbs_id].delete_notification_matcher(name)
@@ -1693,6 +1859,15 @@ def start_backup_verification(cluster_id):
     """Start a PBS backup verification (restore → boot → check → cleanup)"""
     from pegaprox.core.backup_verify import start_verification
 
+    # MK May 2026 (#465 port) — cluster-scoped auth on cluster-id-keyed endpoints.
+    # The earlier #476 batch only covered the pbs_id-keyed `/api/pbs/<id>` routes
+    # via check_pbs_access; these `/api/clusters/<id>/backup-verify*` endpoints
+    # use a different auth-key and went unprotected.
+    from pegaprox.api.helpers import check_cluster_access
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
@@ -1711,7 +1886,7 @@ def start_backup_verification(cluster_id):
     try:
         task_id = start_verification(pve_mgr, data)
     except Exception as e:
-        return jsonify({'error': str(e)}), 409
+        return jsonify({'error': safe_error(e)}), 409
 
     user = request.session.get('user', 'system')
     log_audit(user, 'backup.verify_started',
@@ -1725,6 +1900,12 @@ def start_backup_verification(cluster_id):
 def get_backup_verification_status(cluster_id, task_id):
     """Get status of a running or completed verification"""
     from pegaprox.core.backup_verify import get_verification, get_verification_history
+
+    # MK May 2026 (#465 port) — cluster-scoped auth (see start_backup_verification)
+    from pegaprox.api.helpers import check_cluster_access
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
 
     # check active first
     status = get_verification(task_id)
@@ -1752,6 +1933,12 @@ def get_backup_verification_status(cluster_id, task_id):
 def get_backup_verification_history(cluster_id):
     """Get verification history, optionally filtered by vmid"""
     from pegaprox.core.backup_verify import get_verification_history
+
+    # MK May 2026 (#465 port) — cluster-scoped auth (see start_backup_verification)
+    from pegaprox.api.helpers import check_cluster_access
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
 
     vmid = request.args.get('vmid', type=int)
     limit = request.args.get('limit', 50, type=int)
@@ -1824,7 +2011,7 @@ def probe_pbs_fingerprint():
     except (_sock.gaierror, ConnectionRefusedError, OSError) as e:
         return jsonify({'error': f'cannot reach {host}:{port}: {e}'}), 502
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/pbs/<pbs_id>/health', methods=['GET'])
@@ -2216,12 +2403,20 @@ def get_vms_backup_status(cluster_id):
         if verified_ts and verified_ts > rec['last_verify_ts']:
             rec['last_verify_ts'] = verified_ts
 
-    # PBS-side: walk all linked PBS servers, all datastores, all snapshots
-    for pbs_id, pbs in pbs_managers.items():
-        if cluster_id not in (pbs.linked_clusters or []):
-            continue
-        if not pbs.connected:
-            continue
+    # MK 2026-05-31 (F1b) — parallelise both fanouts: per-PBS-server and
+    # per-PVE-node. Each task collects (vmid, ts, encrypted, verified_ts)
+    # tuples in isolation, then we sequentially _bump them into by_vm at
+    # the end. This separates network I/O (parallel) from shared-state
+    # mutation (sequential) so we don't need a lock around by_vm.
+    #
+    # Was sequential: ΣPBS × Σdatastores + Σnodes × Σbackup-storages PVE
+    # calls back-to-back on one worker. With 2+ PBS servers + 6+ nodes this
+    # easily breached 10s and that's what was wedging /vms-backup-status.
+    from pegaprox.utils.concurrent import run_concurrent_dict
+
+    def _scan_pbs(pbs):
+        """Returns list of (vmid, ts, encrypted, verified_ts) tuples for one PBS server."""
+        bumps = []
         try:
             _ds = pbs.get_datastores() or {}
             stores = _ds.get('data', []) if isinstance(_ds, dict) else (_ds or [])
@@ -2245,50 +2440,104 @@ def get_vms_backup_status(cluster_id):
                 if not vmid:
                     continue
                 ts = sn.get('backup-time') or 0
-                # encryption: PBS marks it via files[].crypt-mode != 'none'
                 files = sn.get('files') or []
                 enc = any((f.get('crypt-mode') or 'none') != 'none' for f in files)
-                # verified state: PBS exposes 'verification' on the snapshot
                 verified_ts = 0
                 v = sn.get('verification') or {}
                 if v.get('state') == 'ok':
                     verified_ts = v.get('upid_time') or ts
                 try:
-                    _bump(int(vmid), ts, encrypted=enc, verified_ts=verified_ts)
+                    bumps.append((int(vmid), ts, enc, verified_ts))
                 except (ValueError, TypeError):
                     continue
+        return bumps
 
-    # PVE-side: scan dump-storages for vzdump files (best-effort — only counts)
-    try:
-        nodes = list(getattr(cm, '_cached_node_dict', {}) or [])
-        for node in (nodes or [n['node'] for n in (cm._api_get(f'https://{cm.host}:{cm.api_port}/api2/json/nodes').json().get('data', []) or [])]):
-            try:
-                r = cm._api_get(f'https://{cm.host}:{cm.api_port}/api2/json/nodes/{node}/storage')
-                stores = r.json().get('data', []) if r.status_code == 200 else []
-            except Exception:
+    # MK 2026-05-31 (D2) — defense-in-depth: PVE-returned node names get
+    # interpolated into URL paths below. PVE has its own naming rules but
+    # if PVE itself were ever compromised, a crafted node like `../foo`
+    # would let it pivot into other PVE namespaces. Cheap belt-and-suspenders
+    # check at the boundary. Mirrors api/nodes.py:_NODE_NAME_RE.
+    import re as _re
+    _SAFE_NODE = _re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+
+    def _scan_node(node):
+        """Returns list of (vmid, ts, encrypted, 0) tuples for one PVE node's vzdump backups."""
+        bumps = []
+        if not node or not _SAFE_NODE.match(node):
+            return bumps
+        try:
+            r = cm._api_get(f'https://{cm.host}:{cm.api_port}/api2/json/nodes/{node}/storage')
+            stores = r.json().get('data', []) if r.status_code == 200 else []
+        except Exception:
+            return bumps
+        for s in stores:
+            if 'backup' not in (s.get('content') or ''):
                 continue
-            for s in stores:
-                if 'backup' not in (s.get('content') or ''):
+            if s.get('type') == 'pbs':
+                continue  # already counted PBS-side
+            store_name = s.get('storage')
+            # MK (D2 cont.) — same belt-and-suspenders for storage names
+            if not store_name or not _SAFE_NODE.match(store_name):
+                continue
+            try:
+                cr = cm._api_get(f'https://{cm.host}:{cm.api_port}/api2/json/nodes/{node}/storage/{store_name}/content?content=backup')
+                items = cr.json().get('data', []) if cr.status_code == 200 else []
+            except Exception:
+                items = []
+            for it in items:
+                vmid = it.get('vmid')
+                ts = it.get('ctime') or 0
+                if vmid is None:
                     continue
-                if s.get('type') == 'pbs':
-                    continue  # already counted via PBS-side scan
-                store_name = s.get('storage')
                 try:
-                    cr = cm._api_get(f'https://{cm.host}:{cm.api_port}/api2/json/nodes/{node}/storage/{store_name}/content?content=backup')
-                    items = cr.json().get('data', []) if cr.status_code == 200 else []
-                except Exception:
-                    items = []
-                for it in items:
-                    vmid = it.get('vmid')
-                    ts = it.get('ctime') or 0
-                    if vmid is None:
-                        continue
-                    try:
-                        _bump(int(vmid), ts, encrypted=bool(it.get('encryption')))
-                    except (ValueError, TypeError):
-                        continue
+                    bumps.append((int(vmid), ts, bool(it.get('encryption')), 0))
+                except (ValueError, TypeError):
+                    continue
+        return bumps
+
+    # PBS-side tasks: one per linked + connected PBS server
+    tasks = {}
+    for pbs_id, pbs in pbs_managers.items():
+        if cluster_id not in (pbs.linked_clusters or []):
+            continue
+        if not pbs.connected:
+            continue
+        tasks[f'pbs:{pbs_id}'] = (lambda p=pbs: _scan_pbs(p))
+
+    # PVE-side tasks: one per ONLINE node. Skip dead nodes — under parallel
+    # fanout they'd park the joinall() at the full timeout, dragging total
+    # wall-time. Sequential code happened to mask this because per-call
+    # connect-fail was fast; parallel waits the slowest call.
+    try:
+        nodes_data = []
+        try:
+            nodes_data = cm._api_get(
+                f'https://{cm.host}:{cm.api_port}/api2/json/nodes'
+            ).json().get('data', []) or []
+        except Exception:
+            nodes_data = []
+        for nd in nodes_data:
+            name = nd.get('node')
+            if not name:
+                continue
+            # PVE marks dead nodes 'offline' or status != 'online' on /nodes
+            status = (nd.get('status') or '').lower()
+            if status and status not in ('online', 'running'):
+                continue
+            tasks[f'node:{name}'] = (lambda nn=name: _scan_node(nn))
     except Exception as e:
-        logging.debug(f'[vms-backup-status] vzdump scan failed: {e}')
+        logging.debug(f'[vms-backup-status] node enum failed: {e}')
+
+    if tasks:
+        # Tight timeout: most PBS + healthy-node calls return in <2s. Anything
+        # stuck longer contributes None and we move on with partial data.
+        results = run_concurrent_dict(tasks, timeout=8)
+        for bumps in results.values():
+            for (vmid, ts, enc, verified_ts) in (bumps or []):
+                try:
+                    _bump(vmid, ts, encrypted=enc, verified_ts=verified_ts)
+                except (ValueError, TypeError):
+                    continue
 
     # Finalize ages
     out = []
@@ -2371,7 +2620,7 @@ def run_backup_job_now(cluster_id, job_id):
             return jsonify({'success': True, 'upid': upid, 'node': pve_node})
         return jsonify({'error': r.text or f'HTTP {r.status_code}'}), r.status_code
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/backup-restore', methods=['POST'])
@@ -2419,7 +2668,7 @@ def restore_backup(cluster_id):
             })
             return jsonify({'success': True, 'task_id': task_id, 'mode': 'test'})
         except Exception as e:
-            return jsonify({'error': str(e)}), 500
+            return jsonify({'error': safe_error(e)}), 500
 
     # Choose vm_type from volid: pbs:backup/vm/100/... vs pbs:backup/ct/100/...
     is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid
@@ -2452,7 +2701,7 @@ def restore_backup(cluster_id):
             err = r.text or f'HTTP {r.status_code}'
         return jsonify({'error': err, 'pve_status': r.status_code}), r.status_code
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/pbs/<pbs_id>/backup-diff', methods=['GET'])

@@ -144,6 +144,12 @@ def get_ws_token():
 def validate_ws_token_api():
     """Validate a WS token - called by standalone VNC/SSH servers
     MK: internal endpoint, consumes the token (single-use)
+
+    MK May 2026 (CodeAnt CWE-285) - if the caller passes ?cluster_id=<id>, also
+    verify the token's user has access to that cluster. Closes the cross-cluster
+    BOLA case where someone with cluster-A access could open a WS for cluster-B
+    and trust the token alone to gate it. cluster_id is OPTIONAL for back-compat
+    (the VNC paths in vms.py / VM-level shells call without it today).
     """
     token = request.args.get('token')
     if not token:
@@ -153,7 +159,64 @@ def validate_ws_token_api():
     if not data:
         return jsonify({'error': 'Invalid or expired token'}), 401
 
-    return jsonify({'valid': True, 'user': data['user'], 'role': data['role']})
+    requested_cluster = (request.args.get('cluster_id') or '').strip()
+    cluster_context = None
+    if requested_cluster:
+        try:
+            from pegaprox.utils.auth import load_users
+            from pegaprox.utils.rbac import get_user_clusters, load_vm_acls
+            users = load_users()
+            user = users.get(data['user'], {})
+            allowed = get_user_clusters(user)
+            access_ok = allowed is None or requested_cluster in allowed
+            if not access_ok:
+                # VM-ACL fallback (mirrors api/helpers.py check_cluster_access)
+                cluster_acls = load_vm_acls().get(requested_cluster, {}) or {}
+                for _vmid, acl in cluster_acls.items():
+                    if data['user'] in (acl.get('users') or []) or '*' in (acl.get('users') or []):
+                        access_ok = True
+                        break
+            if not access_ok:
+                logging.warning(f"[WS-TOKEN] user '{data['user']}' has no access to cluster '{requested_cluster}'")
+                return jsonify({'error': 'Access denied to this cluster'}), 403
+
+            # MK May 2026 - lightweight cluster context for the SSH/VNC proxy.
+            # We intentionally do NOT call mgr._get_node_ip() here: that has a
+            # network-probing first-call path (up to ~15s) which would hang the
+            # validate endpoint when this same Flask process is busy. The proxy
+            # gets the cluster's primary host + any fallback_hosts already known
+            # from the DB. Multi-node clusters where the frontend prefetched a
+            # per-node IP that isn't in this set will need to re-resolve through
+            # the normal cluster-creds endpoint with a session cookie.
+            try:
+                from pegaprox.globals import cluster_managers
+                mgr = cluster_managers.get(requested_cluster)
+                if mgr is not None:
+                    cluster_host = getattr(mgr, 'host', None)
+                    cfg = getattr(mgr, 'config', None)
+                    node_ips = {}
+                    # Include fallback_hosts from the DB — those were discovered by
+                    # the manager at connect time and persist across restarts. Cheap.
+                    fb = getattr(cfg, 'fallback_hosts', None) or []
+                    for i, host in enumerate(fb):
+                        if host:
+                            node_ips[f'_fallback_{i}'] = host
+                    cluster_context = {
+                        'host': cluster_host,
+                        'node_ips': node_ips,
+                        'ssh_port': getattr(cfg, 'ssh_port', 22) or 22,
+                    }
+            except Exception as e:
+                logging.debug(f"[WS-TOKEN] cluster-context build soft-fail: {e}")
+        except Exception as e:
+            logging.error(f"[WS-TOKEN] cluster-access check failed: {e}")
+            # fail closed
+            return jsonify({'error': 'Authorization check failed'}), 500
+
+    resp = {'valid': True, 'user': data['user'], 'role': data['role']}
+    if cluster_context is not None:
+        resp['cluster_context'] = cluster_context
+    return jsonify(resp)
 
 
 @bp.route('/api/sse/updates')

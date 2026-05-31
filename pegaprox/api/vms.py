@@ -2352,11 +2352,11 @@ def test_node_connection(cluster_id):
     except paramiko.AuthenticationException:
         return jsonify({'success': False, 'error': 'Authentication failed. Check username/password.'}), 401
     except paramiko.SSHException as e:
-        return jsonify({'success': False, 'error': f'SSH error: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': safe_error(e, 'SSH error')}), 500
     except socket.timeout:
         return jsonify({'success': False, 'error': 'Connection timeout. Check IP and network.'}), 500
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Connection failed: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': safe_error(e, 'Connection failed')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/join', methods=['POST'])
@@ -3814,37 +3814,48 @@ def unlock_vm_api(cluster_id, node, vm_type, vmid):
 
 
 # NS: Issue #50 - Guest Agent info (hostname, OS, kernel)
+# MK May 2026 — additive enrichment for the monitoring panel: kernel_version,
+# interfaces[] (with MAC + per-NIC IPs), filesystems[], users[], guest_time_ns.
+# All existing fields stay unchanged — old UI consumers render exactly as before.
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/guest-info', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
-    """Get QEMU Guest Agent info (hostname, OS version, kernel)"""
+    """Get QEMU Guest Agent info (hostname, OS, kernel, NICs, filesystems, users, clock)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     if vm_type != 'qemu':
         return jsonify({'agent_running': False}), 200
-    
+
     mgr = cluster_managers[cluster_id]
     result = {'agent_running': False, 'hostname': None, 'os_pretty_name': None,
               'os_id': None, 'os_version': None, 'os_kernel': None, 'os_machine': None,
-              'ip_addresses': []}
-    
+              'ip_addresses': [],
+              'kernel_version': None,
+              'interfaces': [],
+              'users': [],
+              'filesystems': [],
+              'guest_time_ns': None}
+
     try:
         session = mgr._create_session()
         base = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent"
-        
+
         try:
             resp = session.get(f"{base}/get-host-name", timeout=8)
             if resp.status_code == 200:
                 data = resp.json().get('data', {}).get('result', {})
                 result['hostname'] = data.get('host-name')
                 result['agent_running'] = True
+            elif resp.status_code == 500 and 'not running' in (resp.text or '').lower():
+                # short-circuit: agent down, skip the 5 follow-up calls
+                return jsonify(result)
         except Exception:
             pass
-        
+
         try:
             resp = session.get(f"{base}/get-osinfo", timeout=8)
             if resp.status_code == 200:
@@ -3854,6 +3865,7 @@ def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
                 result['os_version'] = data.get('version-id') or data.get('version')
                 result['os_kernel'] = data.get('kernel-release')
                 result['os_machine'] = data.get('machine')
+                result['kernel_version'] = data.get('kernel-version')
                 result['agent_running'] = True
         except Exception:
             pass
@@ -3866,6 +3878,75 @@ def get_vm_guest_info_api(cluster_id, node, vm_type, vmid):
                 result['agent_running'] = True
         except Exception:
             pass
+
+        # MK: per-NIC detail (name + MAC + IPs from inside the guest)
+        try:
+            resp = session.get(f"{base}/network-get-interfaces", timeout=8)
+            if resp.status_code == 200:
+                nics = resp.json().get('data', {}).get('result', []) or []
+                ifaces = []
+                for nic in nics:
+                    nic_ips = [{'address': ip.get('ip-address'),
+                                'family': ip.get('ip-address-type'),
+                                'prefix': ip.get('prefix')}
+                               for ip in (nic.get('ip-addresses') or [])]
+                    ifaces.append({
+                        'name': nic.get('name'),
+                        'mac': nic.get('hardware-address'),
+                        'ips': nic_ips,
+                    })
+                result['interfaces'] = ifaces
+        except Exception:
+            pass
+
+        # MK: filesystems with real fill — same data as /guest-fsinfo, mirrored
+        # here so the detail panel does one round-trip instead of two.
+        try:
+            resp = session.get(f"{base}/get-fsinfo", timeout=8)
+            if resp.status_code == 200:
+                fsraw = resp.json().get('data', {}).get('result', []) or []
+                fslist = []
+                for fs in fsraw:
+                    total = fs.get('total-bytes'); used = fs.get('used-bytes')
+                    mt = fs.get('mountpoint')
+                    if not mt:
+                        continue
+                    pct = round((used / total) * 100, 1) if (isinstance(total,(int,float)) and total > 0 and isinstance(used,(int,float))) else None
+                    fslist.append({
+                        'name': fs.get('name'),
+                        'mountpoint': mt,
+                        'type': fs.get('type'),
+                        'used_bytes': used,
+                        'total_bytes': total,
+                        'used_pct': pct,
+                    })
+                result['filesystems'] = fslist
+        except Exception:
+            pass
+
+        # MK: logged-in users — "who's on this VM right now"
+        try:
+            resp = session.get(f"{base}/get-users", timeout=8)
+            if resp.status_code == 200:
+                ur = resp.json().get('data', {}).get('result', []) or []
+                if isinstance(ur, list):
+                    result['users'] = [{'user': u.get('user'),
+                                        'domain': u.get('domain'),
+                                        'login_time': u.get('login-time')}
+                                       for u in ur]
+        except Exception:
+            pass
+
+        # MK: guest clock vs host (ns since epoch) — ntp sanity check
+        try:
+            resp = session.get(f"{base}/get-time", timeout=8)
+            if resp.status_code == 200:
+                t = resp.json().get('data', {}).get('result')
+                if isinstance(t, (int, float)):
+                    result['guest_time_ns'] = t
+        except Exception:
+            pass
+
     except Exception as e:
         result['error'] = str(e)
 
@@ -3977,7 +4058,7 @@ def get_vm_guest_file_read_api(cluster_id, node, vm_type, vmid):
             })
         return jsonify({'error': resp.text or f'HTTP {resp.status_code}'}), resp.status_code
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/rrd/<timeframe>', methods=['GET'])
@@ -4181,7 +4262,7 @@ def fix_vm_qemu_args(cluster_id, node, vmid):
             'message': 'args updated' if changed else 'args already match current disks'
         })
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        return jsonify({'ok': False, 'error': safe_error(e)}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough', methods=['GET'])
@@ -4963,7 +5044,7 @@ def get_snapshot_config_api(cluster_id, node, vm_type, vmid, snapname):
             return jsonify({'error': f'Failed to fetch snapshot config (status {getattr(r, "status_code", "?")})'}), 502
         return jsonify(r.json().get('data', {}) or {})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': safe_error(e)}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/snapshots/diff', methods=['GET'])
@@ -5611,6 +5692,187 @@ def _execute_local_replication(job):
 # Proxmox native replication only works intra-cluster, so for DR across
 # separate clusters we use snapshot + clone + remote-migrate approach.
 
+# MK May 2026 (#456 @DarmokNoob) — net interface MAC tokens vary by VM type:
+# LXC uses `hwaddr=<mac>`, QEMU uses `<model>=<mac>` where model is virtio/e1000/etc.
+_QEMU_NIC_MODELS = ('virtio', 'e1000', 'e1000-82540em', 'e1000-82544gc', 'e1000-82545em',
+                    'e1000e', 'i82551', 'i82557b', 'i82559er', 'ne2k_isa', 'ne2k_pci',
+                    'pcnet', 'rtl8139', 'vmxnet3')
+
+
+def _extract_nic_mac(nic_value):
+    """Return the MAC from a PVE net interface config string (or None)."""
+    if not isinstance(nic_value, str):
+        return None
+    for part in nic_value.split(','):
+        if '=' not in part:
+            continue
+        key, val = part.split('=', 1)
+        if key == 'hwaddr':
+            return val
+        if key in _QEMU_NIC_MODELS:
+            return val
+    return None
+
+
+def _swap_nic_mac(nic_value, new_mac):
+    """Rewrite a PVE net interface config to use new_mac, preserving every other token."""
+    if not isinstance(nic_value, str) or not new_mac:
+        return nic_value
+    parts = []
+    replaced = False
+    for part in nic_value.split(','):
+        if '=' not in part:
+            parts.append(part)
+            continue
+        key, val = part.split('=', 1)
+        if key == 'hwaddr':
+            parts.append(f'hwaddr={new_mac}')
+            replaced = True
+        elif key in _QEMU_NIC_MODELS:
+            parts.append(f'{key}={new_mac}')
+            replaced = True
+        else:
+            parts.append(part)
+    return ','.join(parts) if replaced else nic_value
+
+
+def _capture_vm_identity(mgr, node, vmid, vm_type):
+    """Pull hostname/name + per-NIC MAC from a VM's config so the xcrepl flow can
+    restore them on the target replica after clone+migrate destroyed both."""
+    out = {'hostname': None, 'name': None, 'nets': {}}
+    try:
+        cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+        resp = mgr._api_get(cfg_url)
+        if resp.status_code != 200:
+            logging.debug(f"[XCREPL] _capture_vm_identity: GET {cfg_url} -> {resp.status_code}")
+            return out
+        cfg = resp.json().get('data', {})
+        if vm_type == 'lxc':
+            out['hostname'] = cfg.get('hostname')
+        else:
+            out['name'] = cfg.get('name')
+        for k, v in cfg.items():
+            if k.startswith('net') and k[3:].isdigit():
+                mac = _extract_nic_mac(v)
+                if mac:
+                    out['nets'][k] = mac
+    except Exception as e:
+        logging.debug(f"[XCREPL] _capture_vm_identity error: {e}")
+    return out
+
+
+def _restore_vm_identity(mgr, node, vmid, vm_type, identity):
+    """Apply the source's hostname/name + per-NIC MAC to a freshly-migrated replica.
+
+    Reads the target's current net config so we preserve bridge / firewall / VLAN-tag /
+    rate-limit tokens that the migration set — only the MAC token gets swapped back to
+    the source value.
+    """
+    if not identity:
+        return
+    cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+    payload = {}
+
+    if vm_type == 'lxc' and identity.get('hostname'):
+        payload['hostname'] = identity['hostname']
+    elif vm_type == 'qemu' and identity.get('name'):
+        payload['name'] = identity['name']
+
+    if identity.get('nets'):
+        try:
+            cur_resp = mgr._api_get(cfg_url)
+            if cur_resp.status_code == 200:
+                cur_cfg = cur_resp.json().get('data', {})
+                for netname, src_mac in identity['nets'].items():
+                    cur_val = cur_cfg.get(netname)
+                    if cur_val:
+                        rebuilt = _swap_nic_mac(cur_val, src_mac)
+                        if rebuilt != cur_val:
+                            payload[netname] = rebuilt
+        except Exception as e:
+            logging.debug(f"[XCREPL] could not read target config for MAC restore: {e}")
+
+    if not payload:
+        return
+
+    put_resp = mgr._api_put(cfg_url, data=payload)
+    if put_resp.status_code == 200:
+        logging.info(f"[XCREPL] Restored identity on {vm_type}/{vmid}: "
+                     f"{'hostname' if vm_type == 'lxc' else 'name'}={payload.get('hostname') or payload.get('name')}, "
+                     f"{sum(1 for k in payload if k.startswith('net'))} NIC(s) MAC-swapped")
+    else:
+        logging.warning(f"[XCREPL] Identity PUT returned {put_resp.status_code}: {put_resp.text[:200]}")
+
+
+# MK May 2026 (#413 @blackshocks) — Replica safety gate. The earlier xcrepl flow
+# deleted any VM on the target that happened to share the source VMID, on the
+# assumption that the VMID-collision had to be a previous run of this same job.
+# Real-world scenario: two freshly-paired clusters where the target already had
+# an UNRELATED VM at the same VMID — the delete destroyed user data.
+#
+# Replicas are now tagged with a job-specific marker after a successful migration,
+# and the safety gate refuses to delete anything that isn't tagged for THIS job.
+# That also prevents cross-job blast: two unrelated xcrepl jobs colliding on the
+# same target VMID won't nuke each other's replicas.
+PEGAPROX_REPLICA_TAG = 'pegaprox-replica'
+
+
+def _job_tag(job_id):
+    return f'xcrepl-job-{job_id}'
+
+
+def _read_target_tags(mgr, node, vmid, vm_type):
+    """Return the set of tags on a VM, or None if config fetch failed."""
+    try:
+        cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+        resp = mgr._api_get(cfg_url)
+        if resp.status_code != 200:
+            return None
+        cfg = resp.json().get('data', {})
+        tags_raw = cfg.get('tags', '') or ''
+        # PVE separates tags by ';' for both LXC and QEMU.
+        return {t.strip() for t in tags_raw.split(';') if t.strip()}
+    except Exception:
+        return None
+
+
+def _is_replica_of_job(mgr, node, vmid, vm_type, job_id):
+    """True iff the target VM is tagged as a replica of THIS specific xcrepl job."""
+    tags = _read_target_tags(mgr, node, vmid, vm_type)
+    if tags is None:
+        return False
+    return _job_tag(job_id) in tags
+
+
+def _tag_as_replica(mgr, node, vmid, vm_type, job_id):
+    """Mark the freshly-migrated replica with the job-specific + general
+    pegaprox-replica tags. Preserves any pre-existing tags so users' own
+    organisation tags stay intact."""
+    cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+    try:
+        resp = mgr._api_get(cfg_url)
+        if resp.status_code != 200:
+            return
+        cfg = resp.json().get('data', {})
+        tags_raw = cfg.get('tags', '') or ''
+        existing = [t.strip() for t in tags_raw.split(';') if t.strip()]
+        want = [PEGAPROX_REPLICA_TAG, _job_tag(job_id)]
+        merged = list(existing)
+        for t in want:
+            if t not in merged:
+                merged.append(t)
+        if merged == existing:
+            return  # nothing to do
+        new_tags = ';'.join(merged)
+        put = mgr._api_put(cfg_url, data={'tags': new_tags})
+        if put.status_code == 200:
+            logging.info(f"[XCREPL] Tagged replica {vm_type}/{vmid} on {node} with {want}")
+        else:
+            logging.warning(f"[XCREPL] tag PUT returned {put.status_code}: {put.text[:200]}")
+    except Exception as e:
+        logging.warning(f"[XCREPL] Could not tag replica {vmid}: {e}")
+
+
 def _execute_replication(job):
     """
     Run a single cross-cluster replication cycle for one job.
@@ -5681,6 +5943,13 @@ def _execute_replication(job):
             return
 
         logging.info(f"[XCREPL] Job {job_id}: replicating {vm_type}/{vmid} from {source_node} -> {target_node} ({target_cid})")
+
+        # MK May 2026 (#456 @DarmokNoob) — capture source identity (hostname/name +
+        # per-NIC hwaddr) BEFORE the clone overwrites the label and PVE re-rolls the MAC.
+        # Replica is supposed to be a drop-in copy of the source for DR — the replica's
+        # hostname + DHCP-MAC need to match or Site Recovery failover lands on the wrong
+        # network identity.
+        source_identity = _capture_vm_identity(source_mgr, source_node, vmid, vm_type)
 
         # 2. create snapshot
         snap_url = (
@@ -5835,7 +6104,22 @@ def _execute_replication(job):
                 logging.warning(f"[XCREPL] Job {job_id}: target existence check failed: {e}")
 
             if existing_target_node:
-                logging.info(f"[XCREPL] Job {job_id}: VM {vmid} already on target node {existing_target_node}, removing old replica")
+                # MK May 2026 (#413 @blackshocks) — refuse to delete unless the existing
+                # target VM is tagged as a replica of THIS job. Without this gate, freshly
+                # paired clusters with an unrelated VM at the matching VMID lose data.
+                if not _is_replica_of_job(target_mgr, existing_target_node, vmid, vm_type, job_id):
+                    target_mgr.delete_api_token(token_name)
+                    _cleanup_clone_and_snap(source_mgr, source_node, clone_vmid, vmid, vm_type, snap_name)
+                    err_msg = (f"Target VM {vmid} on node {existing_target_node} is not tagged as a replica "
+                               f"of this job ({_job_tag(job_id)} tag missing). Refusing to overwrite to "
+                               f"prevent data loss. If this is a stranded replica from a previous run or "
+                               f"manual clone, tag it with `{_job_tag(job_id)}` and re-run. If it is an "
+                               f"unrelated VM, pick a different target VMID for the job.")
+                    _update_repl_status(db, job_id, 'error', err_msg)
+                    logging.error(f"[XCREPL] Job {job_id}: ABORT — {err_msg}")
+                    return
+
+                logging.info(f"[XCREPL] Job {job_id}: VM {vmid} already on target node {existing_target_node}, removing old replica (tag verified)")
                 try:
                     # stop first so PVE lets us delete it (ignore errors if already stopped)
                     stop_url = (
@@ -5886,6 +6170,19 @@ def _execute_replication(job):
                 mig_ok, mig_detail = _wait_for_task(source_mgr, mig_task, timeout=3600)
                 if mig_ok:
                     logging.info(f"[XCREPL] Job {job_id}: migration complete")
+                    # MK May 2026 (#456) — restore source identity on the replica so
+                    # DR failover lands on the right hostname + DHCP-MAC. Best-effort —
+                    # don't fail the whole replication if this trips.
+                    try:
+                        _restore_vm_identity(target_mgr, target_node, vmid, vm_type, source_identity)
+                    except Exception as e:
+                        logging.warning(f"[XCREPL] Job {job_id}: identity restoration failed: {e}")
+                    # MK May 2026 (#413) — tag the replica so the safety gate on the next
+                    # run recognises it as ours and can cycle it without operator action.
+                    try:
+                        _tag_as_replica(target_mgr, target_node, vmid, vm_type, job_id)
+                    except Exception as e:
+                        logging.warning(f"[XCREPL] Job {job_id}: replica-tag write failed: {e}")
                     _update_repl_status(db, job_id, 'ok', '')
                 else:
                     logging.error(f"[XCREPL] Job {job_id}: migration task failed: {mig_detail}")
@@ -5930,6 +6227,18 @@ def _update_repl_status(db, job_id, status, error=''):
         )
     except Exception as e:
         logging.warning(f"[XCREPL] Could not update status for {job_id}: {e}")
+    # MK May 2026 (audit completeness) — emit terminal audit event so the bundle's
+    # audit_log captures the outcome of every xcrepl run, not just `replication.triggered`.
+    # Mirrors the gap that surfaced via #438 on the v2p side: started-only audit forces
+    # log archaeology on every silent-failure investigation.
+    try:
+        if status == 'ok':
+            log_audit('system', 'replication.completed', f'xcrepl job {job_id} succeeded')
+        elif status == 'error':
+            log_audit('system', 'replication.failed',
+                      f'xcrepl job {job_id} failed: {error or "no detail"}')
+    except Exception:
+        pass
 
 
 def _wait_for_task(mgr, task_upid, timeout=600, poll=5):
@@ -6178,12 +6487,25 @@ def run_cross_cluster_replication(job_id):
     if not job:
         return jsonify({'error': 'Replication job not found'}), 404
 
+    # MK May 2026 (#455 @DarmokNoob) — block duplicate triggers while a previous
+    # run is still in-flight. The scheduler uses the same _claim_job() guard.
+    from pegaprox.background.cross_cluster_replication import _claim_job, _release_job, _tracked_run
+    if not _claim_job(job_id):
+        return jsonify({
+            'error': 'Replication job is already running',
+            'detail': 'Wait for the current run to finish, then retry.'
+        }), 409
+
     # kick off in background so the API responds right away
     # NS: detect same-cluster -> use local replication
     job_dict = dict(job)
     is_local = job_dict.get('source_cluster') == job_dict.get('target_cluster')
     handler = _execute_local_replication if is_local else _execute_replication
-    threading.Thread(target=handler, args=(job_dict,), daemon=True).start()
+    try:
+        threading.Thread(target=_tracked_run, args=(handler, job_dict), daemon=True).start()
+    except Exception as e:
+        _release_job(job_id)
+        return jsonify({'error': f'Failed to start replication: {e}'}), 500
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'replication.triggered', f"{'Local' if is_local else 'Cross-cluster'} replication {job_id} manually triggered")
@@ -7497,24 +7819,66 @@ async def ssh_handler(websocket):
         await websocket.close(1008, "No auth")
         return
 
-    # Validate via main server
+    # Validate via main server. MK May 2026 - when called with ws_token + cluster_id,
+    # the response now also carries `cluster_context` (host/node_ips/ssh_port) so we
+    # don't need a second authenticated round-trip. The WS subprocess holds only the
+    # consumed ws-token, no session cookie, so cluster-creds was previously
+    # unreachable from here.
+    node_ip = None
+    cluster_host = None
+    node_ips = {}
     try:
         if ws_token:
-            validate_url = f"{PEGAPROX_URL}/api/ws/token/validate?token={ws_token}"
-            print("Validating WS token...")
+            validate_url = (
+                f"{PEGAPROX_URL}/api/ws/token/validate"
+                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}"
+            )
+            print(f"Validating WS token (cluster={cluster_id}, node={node})...")
         else:
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
             print("Validating session (legacy)...")
 
         headers = {'X-Session-ID': session_id} if session_id else {}
         cookies = {'session': session_id} if session_id else {}
-        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=5, verify=False)
+        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
 
+        if r.status_code == 403:
+            print(f"Auth failed: 403 (no access to cluster {cluster_id})")
+            await websocket.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
+            await websocket.close(1008, "Forbidden")
+            return
         if r.status_code != 200:
             print(f"Auth failed: {r.status_code}")
             await websocket.send('{"status":"error","message":"Session ungültig - bitte neu einloggen"}')
             await websocket.close(1008, "Invalid auth")
             return
+
+        # Pull the cluster context out of the validate response (ws-token path only)
+        if ws_token:
+            try:
+                payload = r.json() or {}
+                ctx = payload.get('cluster_context') or {}
+                cluster_host = ctx.get('host')
+                node_ips = ctx.get('node_ips') or {}
+                node_ip = node_ips.get(node) or node_ips.get(node.lower())
+                print(f"validate→ host={cluster_host} node_ips={node_ips} resolved_node_ip={node_ip}")
+            except Exception as e:
+                print(f"Could not parse validate payload: {e}")
+
+        # Legacy session path: fall back to cluster-creds with the session cookie.
+        if not ws_token and session_id:
+            try:
+                print(f"Fetching cluster creds from: {PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}")
+                rc = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
+                                  cookies={'session': session_id}, timeout=10, verify=False)
+                if rc.status_code == 200:
+                    creds = rc.json()
+                    cluster_host = creds.get('host')
+                    node_ips = creds.get('node_ips', {})
+                    node_ip = node_ips.get(node) or node_ips.get(node.lower())
+            except Exception as e:
+                print(f"Could not get node IP from API: {e}")
+
         print("Auth successful")
     except requests.exceptions.ConnectionError as e:
         print(f"Connection error to main server: {e}")
@@ -7527,75 +7891,45 @@ async def ssh_handler(websocket):
         await websocket.send('{"status":"error","message":"Authentifizierungsfehler"}')
         await websocket.close(1011, "Auth error")
         return
-    
-    # Get node IP - use pre-fetched IP if available
-    node_ip = prefetched_ip if prefetched_ip else None
-    cluster_host = None
-    
-    # Only try API if we don't have a pre-fetched IP
-    if not node_ip:
-        # Method 1: Try API endpoint
-        try:
-            print(f"Fetching cluster creds from: {PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}")
-            r = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}", cookies={'session': session_id}, timeout=10, verify=False)
-            print(f"Cluster creds response: {r.status_code}")
-            if r.status_code == 200:
-                creds = r.json()
-                cluster_host = creds.get('host')
-                node_ips = creds.get('node_ips', {})
-                
-                # Try exact match first, then case-insensitive
-                node_ip = node_ips.get(node) or node_ips.get(node.lower())
-                
-                print(f"Got node_ips: {node_ips}, looking for: {node}, found: {node_ip}, cluster_host: {cluster_host}")
-            else:
-                print(f"Cluster creds failed: {r.status_code} - {r.text[:200] if r.text else 'no body'}")
-        except Exception as e:
-            print(f"Could not get node IP from API: {e}")
-        
-        # Method 2: Fallback - read directly from clusters config file
-        if not cluster_host:
-            try:
-                import os
-                # Try common config locations
-                config_paths = [
-                    'config/clusters.json',  # Relative to working dir
-                    './config/clusters.json',
-                    '/home/admin_321/pegaprox/config/clusters.json',
-                    '/home/admin_321/pegaprox/data/clusters.json',
-                    './data/clusters.json',
-                    os.path.expanduser('~/.pegaprox/clusters.json'),
-                    '/var/lib/pegaprox/clusters.json'
-                ]
-                print(f"Trying config file fallback, cwd={os.getcwd()}")
-                for config_path in config_paths:
-                    if os.path.exists(config_path):
-                        print(f"Found config at: {config_path}")
-                        with open(config_path, 'r') as f:
-                            clusters = json.load(f)
-                        if cluster_id in clusters:
-                            cluster_host = clusters[cluster_id].get('host')
-                            print(f"Got cluster_host from config file: {cluster_host}")
-                            break
-                        else:
-                            print(f"Cluster {cluster_id} not in config, available: {list(clusters.keys())}")
-            except Exception as e:
-                print(f"Config file fallback failed: {e}")
-        
-        # Use cluster_host as fallback for node_ip
-        if not node_ip and cluster_host:
-            node_ip = cluster_host
-            print(f"Using cluster host as fallback: {cluster_host}")
-    
-    # If we still don't have an IP, allow manual entry
+
+    # cluster_host fallback for node_ip (single-node setups where only the host
+    # was registered).
+    if not node_ip and cluster_host:
+        node_ip = cluster_host
+        print(f"Using cluster host as fallback: {cluster_host}")
+
+    # MK May 2026 (CodeAnt CWE-918) - build the SSH allow-list. prefetched_ip from
+    # URL and user-supplied creds.host below must both be in this set; otherwise
+    # an authenticated user could turn PegaProx into an SSH jump host for any
+    # internal IP. Set comes from server-side resolution only.
+    allowed_hosts = set()
+    if cluster_host:
+        allowed_hosts.add(cluster_host)
+    allowed_hosts.update(v for v in (node_ips or {}).values() if v)
+
+    if prefetched_ip:
+        if prefetched_ip in allowed_hosts:
+            node_ip = prefetched_ip
+            print(f"Using prefetched IP (allow-list match): {node_ip}")
+        else:
+            print(f"REJECT prefetched ?ip={prefetched_ip!r} not in {sorted(allowed_hosts)}")
+            await websocket.send(json.dumps({
+                'status': 'error',
+                'message': f"Prefetched IP {prefetched_ip!r} is not a known node of cluster {cluster_id}."
+            }))
+            await websocket.close(1008, "prefetched ip not allowed")
+            return
+
+    # If we still don't have an IP, allow manual entry (but allow-list still applies)
     allow_manual_ip = False
     if not node_ip:
         print(f"No IP found - allowing manual entry")
         node_ip = ""  # Empty - user must provide
         allow_manual_ip = True
-    
+
     print(f"Final node IP for {node}: {node_ip or '(manual entry required)'}")
-    
+    print(f"Allow-list for host override: {sorted(allowed_hosts) or '(empty - no manual override permitted)'}")
+
     # Send need_credentials status - frontend will show login dialog
     await websocket.send(json.dumps({
         'status': 'need_credentials',
@@ -7603,21 +7937,30 @@ async def ssh_handler(websocket):
         'ip': node_ip,
         'allowManualIp': allow_manual_ip
     }))
-    
+
     # Wait for credentials from user
     try:
-        creds_msg = await asyncio.wait_for(websocket.recv(), timeout=300)  # 5 min timeout
+        creds_msg = await asyncio.wait_for(websocket.recv(), timeout=300)
         creds = json.loads(creds_msg)
         ssh_user = creds.get('username', 'root')
         ssh_pass = creds.get('password', '')
-        ssh_key = creds.get('privateKey', '')  # SSH private key (PEM format)
-        
-        # Allow user to override IP (for manual entry)
+        ssh_key = creds.get('privateKey', '')
+
+        # MK May 2026 (CodeAnt CWE-918) - host override is gated by allow_hosts.
+        # Empty set rejects all overrides (no-resolved-cluster case).
         user_ip = creds.get('host', '').strip()
         if user_ip:
+            if user_ip not in allowed_hosts:
+                print(f"REJECT user host override: {user_ip!r} not in {sorted(allowed_hosts)}")
+                await websocket.send(json.dumps({
+                    'status': 'error',
+                    'message': f"Host {user_ip!r} is not a known node of cluster {cluster_id}. Manual override blocked."
+                }))
+                await websocket.close(1008, "host not allowed")
+                return
             node_ip = user_ip
-            print(f"Using user-provided IP: {node_ip}")
-        
+            print(f"Using user-provided IP (allow-list match): {node_ip}")
+
         if not node_ip:
             await websocket.send('{"status":"error","message":"Host/IP address required"}')
             return
@@ -7754,19 +8097,33 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         await client_ws.close(1008, "No auth")
         return
 
-    # Validate via main server (same as shell)
+    # Validate via main server (cluster-scope check + inline cluster context)
+    # MK May 2026 - response carries cluster_context so we don't need a second
+    # authenticated round-trip from the WS subprocess.
+    validate_payload = {}
     try:
         if ws_token:
-            validate_url = f"{PEGAPROX_URL}/api/ws/token/validate?token={ws_token}"
+            validate_url = (
+                f"{PEGAPROX_URL}/api/ws/token/validate"
+                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}"
+            )
         else:
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
         headers = {'X-Session-ID': session_id} if session_id else {}
         cookies = {'session': session_id} if session_id else {}
-        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=5, verify=False)
+        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
+        if r.status_code == 403:
+            await client_ws.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
+            await client_ws.close(1008, "Forbidden")
+            return
         if r.status_code != 200:
             await client_ws.send('{"status":"error","message":"Invalid session"}')
             await client_ws.close(1008, "auth")
             return
+        try:
+            validate_payload = r.json() or {}
+        except Exception:
+            validate_payload = {}
     except Exception as e:
         print(f"[TERMPROXY] auth validate failed: {e}")
         await client_ws.send('{"status":"error","message":"Auth server unreachable"}')
@@ -7790,6 +8147,37 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     pve_user = unquote(pve_user)
     pve_host = unquote(pve_host)
     pve_auth = unquote(pve_auth)
+
+    # MK May 2026 (CodeAnt CWE-918) - SSRF gate. Use the cluster_context already
+    # returned by the validate call; fall back to cluster-creds only on the legacy
+    # session-cookie path (ws-token flow has no session cookie to authenticate it).
+    allowed_hosts = set()
+    ctx = (validate_payload or {}).get('cluster_context') or {}
+    if ctx.get('host'):
+        allowed_hosts.add(ctx['host'])
+    allowed_hosts.update(v for v in (ctx.get('node_ips') or {}).values() if v)
+    if not allowed_hosts and session_id:
+        try:
+            cr = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
+                              cookies={'session': session_id}, timeout=10, verify=False)
+            if cr.status_code == 200:
+                cr_data = cr.json() or {}
+                if cr_data.get('host'):
+                    allowed_hosts.add(cr_data['host'])
+                allowed_hosts.update(v for v in (cr_data.get('node_ips') or {}).values() if v)
+            else:
+                print(f"[TERMPROXY] cluster-creds non-200 ({cr.status_code}); allow-list empty")
+        except Exception as e:
+            print(f"[TERMPROXY] cluster-creds legacy fetch failed: {e}")
+
+    if pve_host not in allowed_hosts:
+        print(f"[TERMPROXY] REJECT host {pve_host!r} (not in {sorted(allowed_hosts)})")
+        await client_ws.send(json.dumps({
+            'status': 'error',
+            'message': f"Host {pve_host!r} is not a known node of cluster {cluster_id}."
+        }))
+        await client_ws.close(1008, "host not allowed")
+        return
 
     # Connect to PVE WS — Cookie uses session auth ticket; URL uses termproxy ticket.
     pve_path = f"/api2/json/nodes/{node}/{vm_type}/{vmid_str}/vncwebsocket?port={pve_port}&vncticket={quote_plus(pve_ticket)}"

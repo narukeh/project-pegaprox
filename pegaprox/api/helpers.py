@@ -31,6 +31,16 @@ def load_server_settings():
         'acme_enabled': False,
         'acme_email': '',
         'acme_staging': False,  # use LE staging for testing
+        'acme_challenge_type': 'http-01',
+        'acme_dns_provider': 'manual',
+        'acme_dns_rfc2136_nameserver': '',
+        'acme_dns_rfc2136_port': 53,
+        'acme_dns_rfc2136_zone': '',
+        'acme_dns_rfc2136_key_name': '',
+        'acme_dns_rfc2136_secret': '',
+        'acme_dns_rfc2136_algorithm': 'hmac-sha512',
+        'acme_dns_rfc2136_ttl': 60,
+        'acme_dns_propagation_seconds': 30,
         'logo_url': '',
         'app_name': 'PegaProx',
         # HTTP redirect port - NS Jan 2026
@@ -156,16 +166,44 @@ def load_server_settings():
             return {**defaults, **saved}
     except Exception as e:
         logging.error(f"Error loading server settings from database: {e}")
-        # Try legacy fallback
-        if os.path.exists(SERVER_SETTINGS_FILE):
-            try:
-                with open(SERVER_SETTINGS_FILE, 'r') as f:
-                    saved = json.load(f)
-                return {**defaults, **saved}
-            except:
-                pass
-    
+        # NS May 2026 - plain-JSON SERVER_SETTINGS_FILE fallback removed (encrypted DB only).
+
     return defaults
+
+
+def decrypt_secret_setting(value, *, label='secret'):
+    """Decrypt an encrypted server setting, preserving legacy plaintext values."""
+    if not value or value == '********':
+        return ''
+    try:
+        return get_db()._decrypt(str(value))
+    except RuntimeError as e:
+        logging.error(f"Failed to decrypt {label}: {e}")
+        return ''
+    except Exception as e:
+        if str(value).startswith(('aes256:', 'gAAAA')):
+            logging.error(f"Could not decrypt encrypted {label}: {e}")
+            return ''
+        logging.warning(f"Could not decrypt {label}; treating as legacy plaintext: {e}")
+        return str(value)
+
+
+def acme_dns_config_from_settings(settings):
+    """Build an RFC 2136 DNS config, decrypting the TSIG secret only for use."""
+    settings = settings or {}
+    return {
+        'nameserver': settings.get('acme_dns_rfc2136_nameserver', ''),
+        'port': settings.get('acme_dns_rfc2136_port', 53),
+        'zone': settings.get('acme_dns_rfc2136_zone', ''),
+        'key_name': settings.get('acme_dns_rfc2136_key_name', ''),
+        'secret': decrypt_secret_setting(
+            settings.get('acme_dns_rfc2136_secret', ''),
+            label='ACME RFC 2136 secret'
+        ),
+        'algorithm': settings.get('acme_dns_rfc2136_algorithm', 'hmac-sha512'),
+        'ttl': settings.get('acme_dns_rfc2136_ttl', 60),
+        'propagation_seconds': settings.get('acme_dns_propagation_seconds', 30),
+    }
 
 
 def save_server_settings(settings):
@@ -299,6 +337,55 @@ def check_cluster_access(cluster_id):
                 return True, None
         return False, (jsonify({'error': 'Access denied to this cluster'}), 403)
     return True, None
+
+
+def check_pbs_access(pbs_id):
+    """Check if current user can access a PBS server based on its linked clusters.
+    Returns (True, None) if allowed, (False, error_response) if not.
+    
+    A PBS server is accessible if:
+    - User is admin (full access), OR
+    - PBS has no linked_clusters (backward compatibility - accessible to all), OR
+    - User has access to at least one of the PBS's linked clusters
+    """
+    from flask import request, jsonify
+    from pegaprox.utils.auth import load_users
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.globals import pbs_managers
+    from pegaprox.models.permissions import ROLE_ADMIN
+    
+    # Check if PBS exists
+    if pbs_id not in pbs_managers:
+        return False, (jsonify({'error': 'PBS server not found'}), 404)
+    
+    pbs_mgr = pbs_managers[pbs_id]
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    
+    # Admins have full access
+    if user.get('role') == ROLE_ADMIN:
+        return True, None
+    
+    # Get PBS linked clusters
+    pbs_linked = pbs_mgr.linked_clusters or []
+    
+    # If PBS has no linked clusters, allow access (backward compatibility)
+    if not pbs_linked:
+        return True, None
+    
+    # Get user's allowed clusters
+    user_clusters = get_user_clusters(user)
+    
+    # If user has access to all clusters (None), allow
+    if user_clusters is None:
+        return True, None
+    
+    # Check if user has access to at least one linked cluster
+    for cluster_id in pbs_linked:
+        if cluster_id in user_clusters:
+            return True, None
+    
+    return False, (jsonify({'error': 'Access denied to this PBS server'}), 403)
 
 
 def safe_error(e, default_msg='An internal error occurred'):

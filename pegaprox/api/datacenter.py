@@ -20,6 +20,75 @@ from pegaprox.api.helpers import get_connected_manager, check_cluster_access, sa
 
 bp = Blueprint('datacenter', __name__)
 
+
+def _list_cluster_node_names(manager):
+    """Return node names from the cluster-wide /nodes endpoint."""
+    try:
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/nodes"
+        response = manager._api_get(url)
+        if response.status_code != 200:
+            return []
+        return [
+            node.get('node') or node.get('name')
+            for node in response.json().get('data', [])
+            if node.get('node') or node.get('name')
+        ]
+    except Exception as e:
+        logging.error(f"Failed to list cluster nodes: {e}")
+        return []
+
+
+def _mask_subscription_key(key: str) -> str:
+    """Return a redacted form of a PVE subscription key for the cluster-wide
+    aggregator. Last four chars stay visible so operators can still tell which
+    license is on which node at a glance; everything before that is replaced
+    with dots. Empty/short keys come back unchanged.
+
+    NS 2026-05-30 — the cluster-wide endpoint is gated by `cluster.view`, which
+    is a much weaker permission than the per-node `/nodes/<n>/subscription`
+    flow (admin.settings for writes). Returning the raw key here meant any
+    read-only user with cluster access could pull every node's license in
+    one call. PVE's own UI gates subscription detail behind `Sys.Audit`, so
+    matching that intent. The full key is still reachable on the per-node
+    endpoint when needed for rotation / debugging.
+    """
+    if not key or not isinstance(key, str):
+        return ''
+    if len(key) <= 8:
+        return key  # short / fake key — masking would obscure everything
+    return '•' * max(0, len(key) - 4) + key[-4:]
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/subscriptions', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_datacenter_subscriptions(cluster_id):
+    """Get subscription status for all nodes in a cluster."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+
+    try:
+        subscriptions = []
+        for node in _list_cluster_node_names(manager):
+            sub = manager.get_node_subscription(node) or {}
+            # NS 2026-05-30 — see _mask_subscription_key docstring. Aggregator
+            # masks; per-node endpoint (admin.settings for writes, node.view
+            # for read) keeps the raw value for rotation flows.
+            subscriptions.append({
+                **sub,
+                'node': node,
+                'serverid': sub.get('serverid') or '',
+                'key': _mask_subscription_key(sub.get('key') or ''),
+                'nextduedate': sub.get('nextduedate') or '',
+                'status': sub.get('status') or 'unknown',
+            })
+        return jsonify(subscriptions)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to get subscriptions')}), 500
+
 # ============================================
 # NS: Multipath Easy Setup - Feb 2026
 # Redundant SAN/iSCSI with multipath
@@ -811,8 +880,14 @@ def get_sdn_overview(cluster_id):
             
             if sdn_resp.status_code == 200:
                 result['available'] = True
-                sdn_data = sdn_resp.json().get('data', {})
-                result['digest'] = sdn_data.get('digest')
+                # MK May 2026 (#413) — PVE 9.x returns /cluster/sdn as a *list* of
+                # available SDN endpoints (zones, vnets, ipams, …). Older clusters
+                # returned a dict-with-digest. Tolerate both — digest is only used
+                # downstream as a cache hint, so it's fine to leave it None when
+                # PVE doesn't expose it on the top-level endpoint.
+                sdn_payload = sdn_resp.json().get('data')
+                if isinstance(sdn_payload, dict):
+                    result['digest'] = sdn_payload.get('digest')
                 logging.info(f"SDN available, digest={result['digest']}")
             elif sdn_resp.status_code == 403:
                 # Permission denied - SDN exists but user can't access
@@ -2204,4 +2279,3 @@ def get_metric_servers(cluster_id):
         return error
 
     return jsonify(manager.get_metric_servers())
-

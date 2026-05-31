@@ -19,7 +19,7 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access
+from pegaprox.api.helpers import check_cluster_access, safe_error
 from pegaprox.core.db import get_db
 
 bp = Blueprint('insights', __name__)
@@ -352,6 +352,177 @@ def capacity_forecast(cluster_id):
     })
 
 
+# MK May 2026 — top-N noisy neighbors. Pure aggregator over /cluster/resources,
+# no history needed. The cpu_percent + mem_percent are instantaneous; the
+# disk_io/net_io rankings sort by cumulative bytes since VM boot which is
+# fine as a "currently active VM" proxy. For real instantaneous rates we'd
+# need RRD deltas — not the use case operators are asking for here.
+_TOP_METRICS = {
+    'cpu':        ('cpu_percent', '%'),
+    'memory':     ('mem_percent', '%'),
+    'disk_usage': ('disk_percent', '%'),
+    'disk_io':    ('_disk_io', 'B'),   # diskread + diskwrite
+    'net_io':     ('_net_io', 'B'),    # netin + netout
+}
+
+
+@bp.route('/api/clusters/<cluster_id>/insights/rollups', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def rollups(cluster_id):
+    # MK May 2026 — per-tag / per-pool aggregation over /cluster/resources.
+    # Larger fleets want "how much CPU/RAM is the 'prod' tag chewing" without
+    # exporting to Grafana. Pure aggregator, no history.
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    group_by = (request.args.get('group_by') or 'tag').lower()
+    if group_by not in ('tag', 'pool'):
+        return jsonify({'error': 'group_by must be tag or pool'}), 400
+
+    # MK defense-in-depth — bound the rollup payload. Fleets with many
+    # distinct tags would otherwise return an unbounded list. Clamp to
+    # [1, 500] with default 100 — sorted by vm_count desc so the top
+    # groups are kept even when limit kicks in.
+    try:
+        limit = max(1, min(500, int(request.args.get('limit') or 100)))
+    except ValueError:
+        limit = 100
+
+    mgr = cluster_managers[cluster_id]
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected', 'offline': True}), 503
+
+    vms = mgr.get_vm_resources() or []
+    only_running = (request.args.get('status') or 'all').lower() == 'running'
+    if only_running:
+        vms = [v for v in vms if v.get('status') == 'running']
+
+    groups = {}  # key → {vm_count, running_count, cpu_sum, mem_sum, maxmem_sum, disk_sum, maxdisk_sum, ...}
+
+    def _add(key, v):
+        g = groups.setdefault(key, {
+            'key': key, 'vm_count': 0, 'running_count': 0,
+            'cpu_sum_pct': 0.0, 'mem_used_bytes': 0, 'mem_max_bytes': 0,
+            'disk_used_bytes': 0, 'disk_max_bytes': 0,
+            'diskread_bytes': 0, 'diskwrite_bytes': 0,
+            'netin_bytes': 0, 'netout_bytes': 0,
+        })
+        g['vm_count'] += 1
+        if v.get('status') == 'running':
+            g['running_count'] += 1
+        g['cpu_sum_pct'] += v.get('cpu_percent') or 0
+        g['mem_used_bytes'] += v.get('mem') or 0
+        g['mem_max_bytes'] += v.get('maxmem') or 0
+        g['disk_used_bytes'] += v.get('disk') or 0
+        g['disk_max_bytes'] += v.get('maxdisk') or 0
+        g['diskread_bytes'] += v.get('diskread') or 0
+        g['diskwrite_bytes'] += v.get('diskwrite') or 0
+        g['netin_bytes'] += v.get('netin') or 0
+        g['netout_bytes'] += v.get('netout') or 0
+
+    for v in vms:
+        if group_by == 'pool':
+            key = v.get('pool') or '(no pool)'
+            _add(key, v)
+        else:
+            # tags: semicolon-separated. VM with no tag → '(untagged)'.
+            # VM with multiple tags counts ONCE per tag — we double-count
+            # intentionally so 'prod' rollup includes a VM also tagged 'critical'.
+            raw = (v.get('tags') or '').strip()
+            tags = [t.strip() for t in raw.replace(',', ';').split(';') if t.strip()]
+            if not tags:
+                tags = ['(untagged)']
+            for t in tags:
+                _add(t, v)
+
+    # derive percentages, sort by total resource usage
+    rolled = list(groups.values())
+    for g in rolled:
+        g['mem_pct'] = round((g['mem_used_bytes'] / g['mem_max_bytes']) * 100, 1) if g['mem_max_bytes'] > 0 else 0
+        g['disk_pct'] = round((g['disk_used_bytes'] / g['disk_max_bytes']) * 100, 1) if g['disk_max_bytes'] > 0 else 0
+        g['cpu_sum_pct'] = round(g['cpu_sum_pct'], 1)
+    rolled.sort(key=lambda r: r['vm_count'], reverse=True)
+    total_group_count = len(rolled)
+    truncated = total_group_count > limit
+    rolled = rolled[:limit]
+
+    return jsonify({
+        'group_by': group_by,
+        'only_running': only_running,
+        'total_vms': len(vms),
+        'group_count': total_group_count,
+        'truncated': truncated,
+        'limit': limit,
+        'groups': rolled,
+    })
+
+
+@bp.route('/api/clusters/<cluster_id>/insights/top-talkers', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def top_talkers(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    metric = (request.args.get('metric') or 'cpu').lower()
+    if metric not in _TOP_METRICS:
+        return jsonify({'error': f'unknown metric (one of: {", ".join(_TOP_METRICS)})'}), 400
+
+    try:
+        limit = max(1, min(100, int(request.args.get('limit') or 10)))
+    except ValueError:
+        limit = 10
+
+    only_running = (request.args.get('status') or 'running').lower() != 'all'
+
+    mgr = cluster_managers[cluster_id]
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected', 'offline': True}), 503
+
+    vms = mgr.get_vm_resources() or []
+    if only_running:
+        vms = [v for v in vms if v.get('status') == 'running']
+
+    # synth composite IO fields once
+    for v in vms:
+        v['_disk_io'] = (v.get('diskread') or 0) + (v.get('diskwrite') or 0)
+        v['_net_io'] = (v.get('netin') or 0) + (v.get('netout') or 0)
+
+    sort_key, unit = _TOP_METRICS[metric]
+    vms.sort(key=lambda x: x.get(sort_key) or 0, reverse=True)
+    top = vms[:limit]
+
+    # trim payload to what the UI cares about
+    out = []
+    for v in top:
+        out.append({
+            'vmid': v.get('vmid'),
+            'name': v.get('name') or f"VM {v.get('vmid')}",
+            'type': v.get('type'),
+            'node': v.get('node'),
+            'status': v.get('status'),
+            'cpu_percent': v.get('cpu_percent'),
+            'mem_percent': v.get('mem_percent'),
+            'disk_percent': v.get('disk_percent'),
+            'disk_io': v.get('_disk_io'),
+            'net_io': v.get('_net_io'),
+            'uptime': v.get('uptime'),
+            'value': v.get(sort_key) or 0,
+        })
+
+    return jsonify({
+        'metric': metric,
+        'unit': unit,
+        'limit': limit,
+        'only_running': only_running,
+        'total_vms': len(vms),
+        'top': out,
+    })
+
+
 @bp.route('/api/insights/force-snapshot', methods=['POST'])
 @require_auth(perms=['admin.api'])
 def force_snapshot():
@@ -373,4 +544,4 @@ def force_snapshot():
             }
         return jsonify(out)
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        return jsonify({'ok': False, 'error': safe_error(e)}), 500

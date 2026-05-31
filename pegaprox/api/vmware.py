@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """vmware + v2p migration routes - split from monolith dec 2025, NS"""
 
+import logging
 import time
 import threading
 import uuid
@@ -11,8 +12,9 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth
+from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
+from pegaprox.utils.rbac import user_can_access_vmware_vm
 from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
 from pegaprox.background.broadcast import broadcast_resources_loop
@@ -96,16 +98,34 @@ def update_vmware_server(vmware_id):
         if not row:
             return jsonify({'error': 'VMware server not found'}), 404
     
+    # MK May 2026 (#469 port) — cred-exfil guard. If host changes WHILE the
+    # password is preserved (came in as ********), don't auto-connect — that
+    # would ship the saved credential to a potentially attacker-controlled host.
+    credentials_preserved = False
+    host_changed = False
+
     if vmware_id in vmware_managers:
         old_mgr = vmware_managers[vmware_id]
+        if (data.get('host') and data.get('host') != old_mgr.host) or \
+           (data.get('port') and int(data.get('port', 443)) != old_mgr.port):
+            host_changed = True
         if data.get('password') == '********':
             data['password'] = old_mgr.password
-    
+            credentials_preserved = True
+
     save_vmware_server(vmware_id, data)
-    
+
     mgr = VMwareManager(vmware_id, data)
     if data.get('enabled', True):
-        mgr.connect()
+        if host_changed and credentials_preserved:
+            try:
+                mgr.connected = False
+                mgr.last_error = 'Host changed — auto-connect skipped for security (preserved credentials). Use Test Connection manually after verifying the new host.'
+            except Exception:
+                pass
+            logging.warning(f"[VMware:{getattr(mgr, 'name', vmware_id)}] Skipped auto-connect after host change with preserved credentials (cred-exfil guard)")
+        else:
+            mgr.connect()
     vmware_managers[vmware_id] = mgr
     
     log_audit(request.session.get('user', 'admin'), 'vmware.updated', f"Updated VMware server: {data.get('name', vmware_id)}")
@@ -268,6 +288,15 @@ def vmware_vm_power(vmware_id, vm_id, action):
     if action not in ('start', 'stop', 'suspend', 'reset'):
         return jsonify({'error': f'Invalid action: {action}'}), 400
     
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.power'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.vm_power_action(vm_id, action)
     if 'error' in result:
@@ -301,6 +330,15 @@ def create_vmware_snapshot(vmware_id, vm_id):
     if not data.get('name'):
         return jsonify({'error': 'Snapshot name required'}), 400
     
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.snapshot'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.create_snapshot(vm_id, data['name'], data.get('description', ''),
                                   data.get('memory', False), data.get('quiesce', True))
@@ -318,6 +356,16 @@ def delete_vmware_snapshot(vmware_id, vm_id, snapshot_id):
     """Delete a VM snapshot"""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.snapshot'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.delete_snapshot(vm_id, snapshot_id)
     if 'error' in result:
@@ -617,9 +665,21 @@ def get_vmware_console(vmware_id, vm_id):
         return jsonify({'error': 'VMware server not found'}), 404
     mgr = vmware_managers[vmware_id]
     mgr.ensure_connected()
+    
+    # Security: Verify VM exists on this VMware server before issuing console ticket
+    # This prevents users from requesting console tickets for arbitrary VM IDs
+    vm_check = mgr.get_vm(vm_id)
+    if 'error' in vm_check:
+        log_audit(request.session.get('user', 'admin'), 'vmware.console.denied',
+                  f"Console access denied for VM {vm_id} @ {mgr.name}: VM not found")
+        return jsonify({'error': 'VM not found or access denied'}), 404
+    
     result = mgr.get_vm_console_ticket(vm_id)
     if 'error' in result:
         return jsonify(result), result.get('status_code', 500)
+    
+    log_audit(request.session.get('user', 'admin'), 'vmware.console.accessed',
+              f"Console ticket issued for VM {vm_id} @ {mgr.name}")
     return jsonify(result.get('data', {}))
 
 
@@ -629,6 +689,16 @@ def update_vmware_vm_config(vmware_id, vm_id):
     """Update VM configuration (CPU, RAM, notes, hot-add, etc)"""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     mgr.ensure_connected()
     data = request.json or {}
@@ -646,6 +716,16 @@ def update_vmware_vm_network(vmware_id, vm_id):
     """Change VM network adapter"""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     data = request.json or {}
     nic_key = int(data.get('nic_key', 0))
@@ -666,6 +746,16 @@ def update_vmware_vm_boot_order(vmware_id, vm_id):
     """Change VM boot order"""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.manage'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     data = request.json or {}
     boot_order = data.get('boot_order', ['disk', 'cdrom', 'net'])
@@ -685,6 +775,15 @@ def clone_vmware_vm(vmware_id, vm_id):
     if not data.get('name'):
         return jsonify({'error': 'Clone name is required'}), 400
     
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.migrate'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.clone_vm(vm_id, data['name'], data.get('folder'), data.get('resource_pool'), data.get('datastore'))
     if 'error' in result:
@@ -701,6 +800,16 @@ def delete_vmware_vm(vmware_id, vm_id):
     """Delete a VM (must be powered off)"""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.power'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.delete_vm(vm_id)
     if 'error' in result:
@@ -720,6 +829,15 @@ def rename_vmware_vm(vmware_id, vm_id):
     data = request.json or {}
     if not data.get('name'):
         return jsonify({'error': 'New name is required'}), 400
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.power'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
     
     mgr = vmware_managers[vmware_id]
     result = mgr.rename_vm(vm_id, data['name'])
@@ -741,6 +859,16 @@ def get_vmware_migration_plan(vmware_id, vm_id):
     Also detects ESXi host and datastore for SSHFS access."""
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.migrate'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     mgr = vmware_managers[vmware_id]
     result = mgr.get_vm_disks_for_export(vm_id)
     if 'error' in result:
@@ -800,11 +928,28 @@ def start_vmware_migration(vmware_id, vm_id):
     """
     if vmware_id not in vmware_managers:
         return jsonify({'error': 'VMware server not found'}), 404
+    
+    # Security fix: Check VM-level authorization
+    from pegaprox.utils.auth import load_users
+    users = load_users()
+    user = users.get(request.session.get('user', ''), {})
+    user['username'] = request.session.get('user', '')
+    
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.migrate'):
+        return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
+    
     data = request.json or {}
     
     for field in ('target_cluster', 'target_node', 'target_storage'):
         if not data.get(field):
             return jsonify({'error': f'{field} is required'}), 400
+
+    # MK May 2026 (#481 port) — target_storage flows into `pvesm` calls on the
+    # PVE node. Validate at the api boundary before the shell touches it.
+    from pegaprox.utils.sanitization import validate_storage_name
+    if not validate_storage_name(data['target_storage']):
+        return jsonify({'error': 'Invalid target_storage name. Must be alphanumeric with hyphens, underscores, or dots only.'}), 400
+
     if not data.get('esxi_password'):
         return jsonify({'error': 'esxi_password is required for SSHFS-based migration'}), 400
     if data['target_cluster'] not in cluster_managers:

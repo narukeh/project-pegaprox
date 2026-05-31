@@ -5281,6 +5281,10 @@
         function InsightsTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
             const [rs, setRs] = React.useState(null);
             const [fc, setFc] = React.useState(null);
+            // LW May 2026 — top-N noisy neighbors card
+            const [top, setTop] = React.useState(null);
+            const [topMetric, setTopMetric] = React.useState('cpu');
+            const [topLoading, setTopLoading] = React.useState(false);
             const [loading, setLoading] = React.useState(false);
             const [forcing, setForcing] = React.useState(false);
             const [exporting, setExporting] = React.useState(false);
@@ -5297,6 +5301,31 @@
                     if (r2 && !r2.error) setFc(r2);
                 } finally { setLoading(false); }
             };
+
+            const refreshTop = async (metric) => {
+                if (!clusterId) return;
+                setTopLoading(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/insights/top-talkers?metric=${metric}&limit=10`).then(r => r?.json()).catch(() => null);
+                    if (r && !r.error) setTop(r);
+                } finally { setTopLoading(false); }
+            };
+
+            React.useEffect(() => { refreshTop(topMetric); /* eslint-disable-line */ }, [clusterId, topMetric]);
+
+            // MK May 2026 — Rollups (per-tag / per-pool aggregation)
+            const [rollups, setRollups] = React.useState(null);
+            const [rollupBy, setRollupBy] = React.useState('tag');
+            const [rollupLoading, setRollupLoading] = React.useState(false);
+            const refreshRollups = async (by) => {
+                if (!clusterId) return;
+                setRollupLoading(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/insights/rollups?group_by=${by}`).then(r => r?.json()).catch(() => null);
+                    if (r && !r.error) setRollups(r);
+                } finally { setRollupLoading(false); }
+            };
+            React.useEffect(() => { refreshRollups(rollupBy); /* eslint-disable-line */ }, [clusterId, rollupBy]);
 
             const forceSnap = async () => {
                 setForcing(true);
@@ -5481,15 +5510,89 @@
                         });
                     }
 
+                    // MK + LW May 2026 — Top Talkers + Rollups in the PDF.
+                    // Uses whatever metric / group_by the user has open in the
+                    // UI when they hit "Export" — same logic as the on-screen
+                    // card so the printed snapshot matches what they're looking at.
+                    const fmtBytesPdf = (n) => {
+                        if (!n) return '0';
+                        const u = ['B','KB','MB','GB','TB','PB'];
+                        let i = Math.floor(Math.log10(n) / 3);
+                        if (i < 0) i = 0; if (i >= u.length) i = u.length - 1;
+                        return `${(n / Math.pow(1000, i)).toFixed(1)} ${u[i]}`;
+                    };
+
+                    if (top && Array.isArray(top.top) && top.top.length) {
+                        const metricLabelMap = {
+                            cpu: t('cpuPercent') || 'CPU %',
+                            memory: t('memoryPercent') || 'Memory %',
+                            disk_usage: t('diskUsagePercent') || 'Disk %',
+                            disk_io: t('diskIo') || 'Disk I/O',
+                            net_io: t('netIo') || 'Net I/O',
+                        };
+                        blocks.push({ type: 'spacer', height: 6 });
+                        blocks.push({
+                            type: 'table',
+                            title: safe(`${t('topTalkers') || 'Top Talkers'} — ${metricLabelMap[top.metric] || top.metric} (${top.top.length}/${top.total_vms || 0})`),
+                            columns: [
+                                '#', 'VMID', safe(t('name') || 'Name'), safe(t('node') || 'Node'),
+                                'CPU%', 'RAM%', 'Disk%',
+                                safe(t('diskIo') || 'Disk I/O'),
+                                safe(t('netIo') || 'Net I/O'),
+                            ],
+                            rows: top.top.map((vm, idx) => [
+                                String(idx + 1),
+                                String(vm.vmid ?? ''),
+                                safe(vm.name || String(vm.vmid || '')),
+                                safe(vm.node || ''),
+                                vm.cpu_percent != null ? `${vm.cpu_percent.toFixed(1)}%` : '-',
+                                vm.mem_percent != null ? `${vm.mem_percent.toFixed(1)}%` : '-',
+                                vm.disk_percent != null ? `${vm.disk_percent.toFixed(1)}%` : '-',
+                                fmtBytesPdf(vm.disk_io),
+                                fmtBytesPdf(vm.net_io),
+                            ]),
+                        });
+                    }
+
+                    if (rollups && Array.isArray(rollups.groups) && rollups.groups.length) {
+                        blocks.push({ type: 'spacer', height: 6 });
+                        const groupLabel = rollups.group_by === 'tag'
+                            ? (t('byTag') || 'By Tag')
+                            : (t('byPool') || 'By Pool');
+                        blocks.push({
+                            type: 'table',
+                            title: safe(`${t('rollups') || 'Rollups'} — ${groupLabel} (${rollups.group_count || 0} ${rollups.group_by === 'tag' ? (t('tags') || 'tags') : (t('pools') || 'pools')})`),
+                            columns: [
+                                rollups.group_by === 'tag' ? safe(t('tag') || 'Tag') : safe(t('pool') || 'Pool'),
+                                'VMs',
+                                safe(t('running') || 'Running'),
+                                'Σ CPU%',
+                                'RAM%',
+                                'Disk%',
+                                safe(t('netIo') || 'Net I/O'),
+                            ],
+                            rows: rollups.groups.map(g => [
+                                safe(g.key || '-'),
+                                String(g.vm_count ?? 0),
+                                String(g.running_count ?? 0),
+                                `${(g.cpu_sum_pct ?? 0).toFixed(1)}%`,
+                                `${(g.mem_pct ?? 0).toFixed(1)}%`,
+                                `${(g.disk_pct ?? 0).toFixed(1)}%`,
+                                fmtBytesPdf((g.netin_bytes || 0) + (g.netout_bytes || 0)),
+                            ]),
+                        });
+                    }
+
                     if (!blocks.length) {
                         addToast(t('insightsLoading') || 'Loading…', 'info');
                         return;
                     }
 
                     const dt = new Date().toISOString().slice(0, 10);
+                    // MK: subtitle now reflects the four sections that may appear
                     await generatePegaProxPDF({
                         title: safe(t('insights') || 'Insights'),
-                        subtitle: safe(`${t('rightSizing') || 'Right-sizing'} + ${t('capacityForecast') || 'Capacity Forecast'}`),
+                        subtitle: safe(`${t('capacityForecast') || 'Capacity Forecast'} · ${t('topTalkers') || 'Top Talkers'} · ${t('rollups') || 'Rollups'} · ${t('rightSizing') || 'Right-sizing'}`),
                         clusterName: safe(clusterName || ''),
                         filename: `pegaprox-insights-${(clusterId || 'cluster')}-${dt}.pdf`,
                         content: blocks,
@@ -5575,6 +5678,143 @@
                                 ))}
                             </div>
                         )}
+                    </div>
+
+                    {/* LW May 2026 — Top Talkers (noisy neighbors) */}
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                                <Icons.Activity className="w-4 h-4" />
+                                {t('topTalkers') || 'Top Talkers'}
+                                {top && <span className="text-xs text-gray-500 font-normal">
+                                    ({top.top?.length || 0} {t('of') || 'of'} {top.total_vms || 0} {t('runningVms') || 'running VMs'})
+                                </span>}
+                            </h3>
+                            <select value={topMetric} onChange={e => setTopMetric(e.target.value)}
+                                className="bg-proxmox-dark border border-proxmox-border rounded px-2 py-1 text-xs text-white">
+                                <option value="cpu">{t('cpuPercent') || 'CPU %'}</option>
+                                <option value="memory">{t('memoryPercent') || 'Memory %'}</option>
+                                <option value="disk_usage">{t('diskUsagePercent') || 'Disk %'}</option>
+                                <option value="disk_io">{t('diskIo') || 'Disk I/O (bytes total)'}</option>
+                                <option value="net_io">{t('netIo') || 'Net I/O (bytes total)'}</option>
+                            </select>
+                        </div>
+                        {topLoading && !top && <div className="text-sm text-gray-500">{t('loading') || 'Loading…'}</div>}
+                        {top && Array.isArray(top.top) && top.top.length > 0 && (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead className="text-xs text-gray-400">
+                                        <tr>
+                                            <th className="text-left p-2 w-8">#</th>
+                                            <th className="text-left p-2">VM</th>
+                                            <th className="text-left p-2">Node</th>
+                                            <th className="text-right p-2">CPU</th>
+                                            <th className="text-right p-2">RAM</th>
+                                            <th className="text-right p-2">Disk</th>
+                                            <th className="text-right p-2">Disk I/O</th>
+                                            <th className="text-right p-2">Net I/O</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {top.top.map((vm, idx) => {
+                                            const fmtBytes = (n) => {
+                                                if (!n) return '0';
+                                                const u = ['B','KB','MB','GB','TB','PB'];
+                                                let i = Math.floor(Math.log10(n) / 3);
+                                                if (i < 0) i = 0; if (i >= u.length) i = u.length - 1;
+                                                return `${(n / Math.pow(1000, i)).toFixed(1)} ${u[i]}`;
+                                            };
+                                            const hi = (k) => topMetric === k ? 'bg-proxmox-orange/10' : '';
+                                            return (
+                                                <tr key={vm.vmid} className="border-t border-proxmox-border hover:bg-proxmox-dark/40">
+                                                    <td className="p-2 text-gray-500 font-mono">{idx + 1}</td>
+                                                    <td className="p-2">
+                                                        <span className="text-white font-medium">{vm.name}</span>
+                                                        <span className="text-xs text-gray-500 ml-2 font-mono">#{vm.vmid}</span>
+                                                    </td>
+                                                    <td className="p-2 text-gray-400">{vm.node}</td>
+                                                    <td className={`p-2 text-right font-mono ${hi('cpu')}`}>{vm.cpu_percent != null ? `${vm.cpu_percent.toFixed(1)}%` : '-'}</td>
+                                                    <td className={`p-2 text-right font-mono ${hi('memory')}`}>{vm.mem_percent != null ? `${vm.mem_percent.toFixed(1)}%` : '-'}</td>
+                                                    <td className={`p-2 text-right font-mono ${hi('disk_usage')}`}>{vm.disk_percent != null ? `${vm.disk_percent.toFixed(1)}%` : '-'}</td>
+                                                    <td className={`p-2 text-right font-mono ${hi('disk_io')}`}>{fmtBytes(vm.disk_io)}</td>
+                                                    <td className={`p-2 text-right font-mono ${hi('net_io')}`}>{fmtBytes(vm.net_io)}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                        {top && Array.isArray(top.top) && top.top.length === 0 && (
+                            <div className="text-sm text-gray-500">{t('noRunningVms') || 'No running VMs to rank.'}</div>
+                        )}
+                        <div className="text-xs text-gray-500 mt-2">
+                            {t('topTalkersHint') || 'CPU/RAM/Disk are instantaneous; Disk I/O and Net I/O are cumulative since VM boot (active VMs sort to the top).'}
+                        </div>
+                    </div>
+
+                    {/* MK May 2026 — Per-tag / Per-pool rollups */}
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                                <Icons.Tag className="w-4 h-4" />
+                                {t('rollups') || 'Rollups'}
+                                {rollups && <span className="text-xs text-gray-500 font-normal">
+                                    ({rollups.group_count || 0} {rollupBy === 'tag' ? (t('tags') || 'tags') : (t('pools') || 'pools')} · {rollups.total_vms || 0} VMs)
+                                </span>}
+                            </h3>
+                            <select value={rollupBy} onChange={e => setRollupBy(e.target.value)}
+                                className="bg-proxmox-dark border border-proxmox-border rounded px-2 py-1 text-xs text-white">
+                                <option value="tag">{t('byTag') || 'By Tag'}</option>
+                                <option value="pool">{t('byPool') || 'By Pool'}</option>
+                            </select>
+                        </div>
+                        {rollupLoading && !rollups && <div className="text-sm text-gray-500">{t('loading') || 'Loading…'}</div>}
+                        {rollups && Array.isArray(rollups.groups) && rollups.groups.length > 0 && (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead className="text-xs text-gray-400">
+                                        <tr>
+                                            <th className="text-left p-2">{rollupBy === 'tag' ? (t('tag') || 'Tag') : (t('pool') || 'Pool')}</th>
+                                            <th className="text-right p-2">VMs</th>
+                                            <th className="text-right p-2">{t('running') || 'Running'}</th>
+                                            <th className="text-right p-2">Σ CPU%</th>
+                                            <th className="text-right p-2">RAM</th>
+                                            <th className="text-right p-2">Disk</th>
+                                            <th className="text-right p-2">Net I/O</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {rollups.groups.map(g => {
+                                            const fmtBytes = (n) => {
+                                                if (!n) return '0';
+                                                const u = ['B','KB','MB','GB','TB','PB'];
+                                                let i = Math.floor(Math.log10(n) / 3);
+                                                if (i < 0) i = 0; if (i >= u.length) i = u.length - 1;
+                                                return `${(n / Math.pow(1000, i)).toFixed(1)} ${u[i]}`;
+                                            };
+                                            return (
+                                                <tr key={g.key} className="border-t border-proxmox-border hover:bg-proxmox-dark/40">
+                                                    <td className="p-2 text-white font-medium">{g.key}</td>
+                                                    <td className="p-2 text-right font-mono">{g.vm_count}</td>
+                                                    <td className="p-2 text-right font-mono">{g.running_count}</td>
+                                                    <td className="p-2 text-right font-mono">{g.cpu_sum_pct?.toFixed(1)}%</td>
+                                                    <td className="p-2 text-right font-mono" title={`${fmtBytes(g.mem_used_bytes)} / ${fmtBytes(g.mem_max_bytes)}`}>{g.mem_pct?.toFixed(1)}%</td>
+                                                    <td className="p-2 text-right font-mono" title={`${fmtBytes(g.disk_used_bytes)} / ${fmtBytes(g.disk_max_bytes)}`}>{g.disk_pct?.toFixed(1)}%</td>
+                                                    <td className="p-2 text-right font-mono">{fmtBytes((g.netin_bytes || 0) + (g.netout_bytes || 0))}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                        {rollups && rollups.groups?.length === 0 && (
+                            <div className="text-sm text-gray-500">{t('noGroupings') || 'No VMs grouped yet.'}</div>
+                        )}
+                        <div className="text-xs text-gray-500 mt-2">
+                            {t('rollupsHint') || 'VMs with multiple tags count in each tag rollup. CPU is the sum of instantaneous %; RAM/Disk are aggregate fill ratios; Net I/O is cumulative since VM boot.'}
+                        </div>
                     </div>
 
                     {/* Right-sizing */}
@@ -7264,6 +7504,8 @@
             const [activeTab, setActiveTab] = useState('overview');
             const [resourcesSubTab, setResourcesSubTab] = useState('management');
             const [sidebarTopology, setSidebarTopology] = useState(false);
+            // MK May 2026 — Worldmap top-level sidebar entry (offline cluster geo-view)
+            const [sidebarWorldmap, setSidebarWorldmap] = useState(false);
             const [showUserMenu, setShowUserMenu] = useState(false);
             const [showSettings, setShowSettings] = useState(false);
             const [showProfile, setShowProfile] = useState(false);
@@ -7513,7 +7755,7 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
@@ -13245,7 +13487,7 @@
                                         <div className="space-y-3">
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
@@ -13284,7 +13526,7 @@
                                             {/* NS: Mar 2026 - Topology sidebar entry (#142) */}
                                             {isCorporate && (
                                                 <button
-                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); }}
                                                     className="w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5"
                                                     style={sidebarTopology ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
                                                     onMouseEnter={(e) => { if (!sidebarTopology) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}}
@@ -13294,6 +13536,38 @@
                                                     <span className="flex-1 text-left truncate">{t('topologyView') || 'Topology'}</span>
                                                 </button>
                                             )}
+
+                                            {/* MK May 2026 — Worldmap sidebar entry (offline cluster geo-view) */}
+                                            <button
+                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
+                                                className={isCorporate
+                                                    ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
+                                                    : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                        sidebarWorldmap
+                                                            ? 'bg-gradient-to-r from-blue-500/20 to-cyan-600/10 border border-blue-500/30 text-white'
+                                                            : 'bg-proxmox-card border border-proxmox-border hover:border-blue-500/30 text-gray-300 hover:text-white'
+                                                      }`
+                                                }
+                                                style={isCorporate ? (sidebarWorldmap ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                onMouseEnter={isCorporate ? (e) => { if (!sidebarWorldmap) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                onMouseLeave={isCorporate ? (e) => { if (!sidebarWorldmap) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                            >
+                                                {isCorporate ? (
+                                                    <Icons.Globe className="w-4 h-4 flex-shrink-0" style={{color: sidebarWorldmap ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
+                                                ) : (
+                                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarWorldmap ? 'bg-blue-500/20' : 'bg-proxmox-dark'}`}>
+                                                        <Icons.Globe className="w-4 h-4 text-blue-400" />
+                                                    </div>
+                                                )}
+                                                <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left'}>
+                                                    {isCorporate ? (t('worldMap') || 'World Map') : (
+                                                        <div>
+                                                            <div className="text-sm font-medium">{t('worldMap') || 'World Map'}</div>
+                                                            <div className="text-xs text-gray-500">{t('worldMapHint') || 'Cluster locations'}</div>
+                                                        </div>
+                                                    )}
+                                                </span>
+                                            </button>
 
                                             {/* LW: Mar 2026 - XHM sidebar (only when both PVE + XCP-ng clusters exist) */}
                                             {clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng') && (
@@ -20522,6 +20796,26 @@
                                             )}
                                         </div>
                                     </div>
+                                ) : sidebarWorldmap ? (
+                                    /* MK May 2026 — Worldmap fullscreen route */
+                                    <div className={isCorporate ? '' : 'space-y-4'}>
+                                        {isCorporate && (
+                                            <div className="corp-content-header">
+                                                <div className="flex items-center gap-2">
+                                                    <Icons.Globe className="w-4 h-4" style={{color: 'var(--corp-accent)'}} />
+                                                    <span className="corp-header-title">{t('worldMap') || 'World Map'}</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <WorldMapView
+                                            clusters={clusters}
+                                            onSelectCluster={(c) => {
+                                                const full = clusters.find(x => x.id === c.id);
+                                                if (full) { setSelectedCluster(full); setSidebarWorldmap(false); }
+                                            }}
+                                            fetchClusters={fetchClusters}
+                                        />
+                                    </div>
                                 ) : sidebarXHM ? (
                                     /* NS: Mar 2026 - Cross-Hypervisor Migration view */
                                     <div className={isCorporate ? '' : 'space-y-6'}>
@@ -23329,7 +23623,7 @@
         }
 
         function App() {
-            const { user, loading, requires2FASetup } = useAuth();
+            const { user, loading, requires2FASetup, needsSetup } = useAuth();
 
             if (loading) {
                 return (
@@ -23345,6 +23639,13 @@
                         </div>
                     </div>
                 );
+            }
+
+            // MK May 2026 — first-run setup wizard takes precedence over the login form
+            // until the operator creates the first admin (replaces the old hardcoded
+            // `pegaprox/admin` bootstrap that exposed every fresh install).
+            if (!user && needsSetup) {
+                return <SetupWizard />;
             }
 
             if (!user) {

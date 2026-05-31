@@ -90,3 +90,70 @@ def validate_hostname(hostname: str) -> bool:
     return bool(re.match(ip_pattern, hostname) or re.match(hostname_pattern, hostname))
 
 
+def validate_storage_name(storage) -> bool:
+    """Validate Proxmox / XCP-ng storage identifier.
+
+    PVE/XCP storage names are alphanumeric + dash + underscore + dot. Anything
+    outside that set has no legitimate use in our context and reaching us is a
+    sign of an injection attempt against the `pvesm` / `qm` shell calls that
+    embed the storage name. MK May 2026 (Aikido #481 port — original PR was
+    closed-superseded by mistake; manually ported after re-review.)
+    """
+    if not storage or not isinstance(storage, str):
+        return False
+    # Must start with alphanumeric, 1-100 chars total, set: [A-Za-z0-9._-]
+    pattern = r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,99}$'
+    return bool(re.match(pattern, storage))
+
+
+def sanitize_csv_field(value) -> str:
+    """Sanitize field for CSV export to prevent formula injection.
+    
+    Neutralizes leading characters (=, +, -, @, tab, carriage return) that
+    spreadsheet applications interpret as formula prefixes. Prepends a single
+    quote to force literal interpretation while preserving the original value.
+    
+    References:
+    - OWASP: https://owasp.org/www-community/attacks/CSV_Injection
+    - CWE-1236: Improper Neutralization of Formula Elements in a CSV File
+    """
+    if value is None:
+        return ''
+    
+    # Convert to string
+    s = str(value)
+    
+    # Check if the field starts with a formula-triggering character
+    # =, +, -, @ are the primary formula prefixes
+    # \t (tab) and \r (carriage return) can also be exploited in some contexts
+    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+        # Prepend single quote to force literal interpretation
+        # This is the recommended mitigation per OWASP guidance
+        return "'" + s
+
+    return s
+
+
+def sanitize_log_message(value) -> str:
+    """Strip CR/LF from a value before writing it to the text audit log.
+
+    Without this, an attacker who controls any audit field (e.g. submits a
+    username containing `\\nAudit: admin - deleted_everything`) could inject
+    a fake-looking log line and confuse anyone tailing the file. The DB
+    record stores the unmodified value, so this only sanitises the text
+    stream.
+
+    CWE-117 / OWASP Log Injection.
+    """
+    if value is None:
+        return ''
+    # MK May 2026 - cheap str-replace, called on every audit log write.
+    # Also strips the unicode line separators U+2028/U+2029 which some viewers
+    # (and json.dumps without ensure_ascii) treat as newlines. Tab is left
+    # alone (legitimate in some action strings).
+    s = str(value)
+    s = s.replace('\r', ' ').replace('\n', ' ')
+    s = s.replace('\u2028', ' ').replace('\u2029', ' ')
+    return s
+
+

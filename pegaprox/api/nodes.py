@@ -123,6 +123,76 @@ def get_node_network_api(cluster_id, node):
     return jsonify(manager.get_node_network_config(node))
 
 
+# MK May 2026 — node-name regex (mirrors vms.py:2718 hardening). RFC-1035-ish
+# DNS rules: letter-led, then letters/digits/hyphen/dot, max ~63. Everything
+# else gets a 400 before the value flows into _get_node_ip() / PVE API URLs.
+_NODE_NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+
+
+def _reject_bad_node(node):
+    """Return (None, None) if node looks valid, (response, 400) otherwise.
+    Used by the SSH-fronted node endpoints below as a defense-in-depth gate
+    even though the SSH commands themselves don't interpolate `node`."""
+    if not node or not _NODE_NAME_RE.match(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    return None, None
+
+
+# MK May 2026 — per-NIC error/drop counters (SSH /proc/net/dev).
+# PVE's own /network endpoint only carries bridge+bond config; for the
+# actual rx_err/rx_drop/tx_err counters operators need we have to read
+# /proc/net/dev directly. Same auth path the syslog viewer uses.
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/netstats', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_netstats_api(cluster_id, node):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    bad, code = _reject_bad_node(node)
+    if bad is not None: return bad, code
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    result = cluster_managers[cluster_id].get_node_netstats(node)
+    if isinstance(result, dict) and result.get('error'):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
+# MK May 2026 — cluster health: corosync ring + pvecm quorum + service state.
+# /cluster/status gives "are we quorate" but not ring latency, per-service
+# uptime, or per-ring health — chasing a flapping cluster needs all three.
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/cluster-health', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_cluster_health_api(cluster_id, node):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    bad, code = _reject_bad_node(node)
+    if bad is not None: return bad, code
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    result = cluster_managers[cluster_id].get_node_cluster_health(node)
+    if isinstance(result, dict) and result.get('error'):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
+# MK May 2026 — lm-sensors readings (CPU temp, fan rpm, voltages).
+# Graceful on hosts without lm-sensors installed (returns error string the
+# UI can show as "not available").
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/sensors', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_sensors_api(cluster_id, node):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    bad, code = _reject_bad_node(node)
+    if bad is not None: return bad, code
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    result = cluster_managers[cluster_id].get_node_sensors(node)
+    if isinstance(result, dict) and result.get('error'):
+        return jsonify(result), 502
+    return jsonify(result)
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/network/<iface>', methods=['PUT'])
 @require_auth(perms=['node.network'])
 def update_node_network_api(cluster_id, node, iface):
@@ -509,6 +579,47 @@ def update_node_subscription_api(cluster_id, node):
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
         log_audit(usr, 'subscription.updated', f"Subscription key updated for {node}", cluster=mgr.config.name)
+        return jsonify({'message': result['message']})
+    return jsonify({'error': result['error']}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/subscription', methods=['POST'])
+@require_auth(perms=['admin.settings'])
+def check_node_subscription_api(cluster_id, node):
+    """Refresh subscription status - admin only"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    mgr = cluster_managers[cluster_id]
+    data = request.json or {}
+    result = mgr.check_node_subscription(node, bool(data.get('force', False)))
+
+    if result['success']:
+        usr = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(usr, 'subscription.checked', f"Subscription checked for {node}", cluster=mgr.config.name)
+        return jsonify({'message': 'Subscription check started', 'data': result.get('data')})
+    return jsonify({'error': result['error']}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/subscription', methods=['DELETE'])
+@require_auth(perms=['admin.settings'])
+def delete_node_subscription_api(cluster_id, node):
+    """Delete subscription key - admin only"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    mgr = cluster_managers[cluster_id]
+    result = mgr.delete_node_subscription(node)
+
+    if result['success']:
+        usr = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(usr, 'subscription.deleted', f"Subscription key deleted for {node}", cluster=mgr.config.name)
         return jsonify({'message': result['message']})
     return jsonify({'error': result['error']}), 500
 
@@ -1956,4 +2067,3 @@ def get_vm_guest_metrics_api(cluster_id, vmid):
     if not hasattr(mgr, 'get_guest_metrics'):
         return jsonify({})
     return jsonify(mgr.get_guest_metrics(None, vmid))
-

@@ -143,13 +143,28 @@ def broadcast_resources_loop():
                     # NS: Feb 2026 - AUTO-RECONNECT disconnected clusters
                     # Without this, a network reload (ifreload) permanently kills the connection
                     # until PegaProx is restarted. Now we retry every 10 seconds.
+                    # MK 2026-05-31 — log backoff. Previously the "is disconnected,
+                    # attempting reconnect..." INFO line fired every 10s while a
+                    # cluster stayed down → ~360 INFO entries per hour per dead
+                    # cluster filling up the log file. Now: INFO on the first
+                    # attempt + once every 50 attempts (~8min) for ongoing
+                    # visibility, DEBUG in between. Reconnect cadence itself is
+                    # unchanged.
                     if not mgr.is_connected:
                         if now - mgr._last_reconnect_attempt >= 10:
                             mgr._last_reconnect_attempt = now
-                            logging.info(f"[SSE] Cluster '{cid}' is disconnected, attempting reconnect...")
+                            attempt_count = getattr(mgr, '_reconnect_attempt_count', 0) + 1
+                            mgr._reconnect_attempt_count = attempt_count
+                            _attempt_log = (logging.info if attempt_count == 1 or attempt_count % 50 == 0
+                                            else logging.debug)
+                            _attempt_log(f"[SSE] Cluster '{cid}' is disconnected, "
+                                         f"attempting reconnect (try #{attempt_count})...")
                             try:
                                 if mgr.connect_to_proxmox():
-                                    logging.info(f"[SSE] Cluster '{cid}' reconnected successfully!")
+                                    logging.info(f"[SSE] Cluster '{cid}' reconnected successfully "
+                                                 f"after {attempt_count} attempt(s)!")
+                                    mgr._reconnect_attempt_count = 0
+                                    mgr._sse_cooldown_until = 0  # clear any pending cooldown
                                     # only notify if last broadcast was >60s ago (avoid toast spam on WAN)
                                     last_notified = getattr(mgr, '_last_reconnect_broadcast', 0)
                                     if now - last_notified >= 60:
@@ -159,6 +174,17 @@ def broadcast_resources_loop():
                                             'cluster_id': cid,
                                             'message': f'Connection to cluster restored'
                                         }, cid)
+                                    # MK 2026-05-31 — push a fresh metrics
+                                    # snapshot immediately so the UI flips
+                                    # to "online" without waiting one full
+                                    # loop tick. Worst case the next-loop
+                                    # broadcast just re-confirms.
+                                    try:
+                                        _fresh = mgr.get_node_status()
+                                        if _fresh:
+                                            broadcast_sse('metrics', _fresh, cid)
+                                    except Exception:
+                                        pass
                                 else:
                                     logging.debug(f"[SSE] Cluster '{cid}' reconnect failed, will retry in 10s")
                             except Exception as e:
@@ -177,7 +203,7 @@ def broadcast_resources_loop():
                     except Exception as e:
                         logging.debug(f"[SSE] {cid} get_tasks failed: {e}")
                         # cooldown so we don't hammer a hung host
-                        mgr._sse_cooldown_until = time.time() + 15
+                        mgr._sse_cooldown_until = time.time() + 10
                         broadcast_sse('tasks', [], cid)
                         return
                     task_list = tasks or []
@@ -206,7 +232,7 @@ def broadcast_resources_loop():
                     except Exception as e:
                         # NS May 2026 — surface this in debug; cooldown if frequent
                         logging.debug(f"[SSE] {cid} get_node_status failed: {e}")
-                        mgr._sse_cooldown_until = time.time() + 15
+                        mgr._sse_cooldown_until = time.time() + 10
                     
                     # NS: Resources every loop now (was every 2nd loop)
                     # This makes VM status update much faster in the UI
@@ -328,11 +354,15 @@ def broadcast_resources_loop():
             # NS May 2026 — periodic heartbeat. Lets the frontend distinguish
             # "server still ticking, just no data" from "server dead". Frontend
             # watchdog force-reconnects if no message for >30s.
-            if loop_count % 5 == 0:
-                try:
-                    broadcast_sse('heartbeat', {'ts': time.time(), 'loop': loop_count})
-                except Exception:
-                    pass
+            # MK May 2026 (#484) — was `loop_count % 5 == 0`. With a dead node
+            # in the cluster the per-cluster fan-out can wall on the join(8s)
+            # timeout for every cycle, so heartbeat-every-5-loops drifts out
+            # to ~40s between beats and the frontend's 30s wedge fires. Cost
+            # of one tiny SSE message per second is negligible, just send it.
+            try:
+                broadcast_sse('heartbeat', {'ts': time.time(), 'loop': loop_count})
+            except Exception:
+                pass
 
             # NS: Reduced to 1 second for faster task updates
             # Proxmox API can handle this - it's just GET requests
