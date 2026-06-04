@@ -980,14 +980,26 @@ def upload_to_datastore(cluster_id, storage_name):
         upload_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage_name}/upload"
 
         with open(tmp_path, 'rb') as fh:
-            files = {
-                'filename': (filename, fh, 'application/octet-stream')
-            }
-            data = {
-                'content': content_type
-            }
+            # MK 2026-06-04 (#525 ccesario): switched from `files=` (which
+            # makes requests run fp.read() to encode the whole multipart
+            # body into memory before sending — OOMs the appliance for
+            # 2+ GB ISOs with MemoryError out of requests.models._encode_files)
+            # to MultipartEncoder, which exposes a file-like body that
+            # requests streams chunk-by-chunk over the wire. Memory
+            # footprint becomes constant in the file size — a 50 GB ISO
+            # uses the same RAM as a 5 MB one.
+            from requests_toolbelt.multipart.encoder import MultipartEncoder
+            encoder = MultipartEncoder(fields={
+                'filename': (filename, fh, 'application/octet-stream'),
+                'content': content_type,
+            })
             # NS: use _api_post for auto-reconnect tracking, 1h timeout for large ISOs
-            response = manager._api_post(upload_url, files=files, data=data, timeout=3600)
+            response = manager._api_post(
+                upload_url,
+                data=encoder,
+                headers={'Content-Type': encoder.content_type},
+                timeout=3600,
+            )
 
         if response.status_code == 200:
             result = response.json()

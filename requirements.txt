@@ -24,6 +24,11 @@ werkzeug>=3.1.6
 # (PR #404 Snyk auto-fix used exact `==2.7.0`; broadened back to `>=` so future
 # patches roll in cleanly.)
 requests>=2.33.0
+# MK 2026-06-04 (#525 ccesario): MultipartEncoder for streaming large
+# (>2 GB) ISO uploads. Plain `requests` files= path runs fp.read() and
+# buffers the whole file in memory before encoding the multipart body,
+# which OOMs the appliance on big ISOs.
+requests-toolbelt>=1.0.0
 urllib3>=2.7.0
 dnspython>=2.7.0
 
