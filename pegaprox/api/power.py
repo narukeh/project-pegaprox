@@ -35,6 +35,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access
 from pegaprox.core.db import get_db
+from pegaprox.core.dbcrypto import run_heavy_read
 from pegaprox.models.permissions import ROLE_ADMIN
 
 bp = Blueprint('power', __name__)
@@ -94,9 +95,9 @@ def _load_history(cluster_id, days=30):
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     out = []
     try:
-        c = get_db().conn.cursor()
-        c.execute("SELECT timestamp, data FROM metrics_history WHERE timestamp >= ? ORDER BY timestamp ASC", (cutoff,))
-        for row in c.fetchall():
+        # NS 2026-06-04: off-hub read (see dbcrypto.run_heavy_read).
+        rows = run_heavy_read("SELECT timestamp, data FROM metrics_history WHERE timestamp >= ? ORDER BY timestamp ASC", (cutoff,))
+        for row in rows:
             try:
                 d = json.loads(row['data'])
                 cd = (d.get('clusters') or {}).get(cluster_id)

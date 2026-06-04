@@ -217,6 +217,51 @@ def _apply_sqlcipher_pragmas(conn, db_path: str) -> None:
         cur.close()
 
 
+# ─── Off-hub heavy reads (scaling) ───────────────────────────────────────────
+# NS 2026-06-04 — measured scaling fix for large fleets (#526/#528 class).
+# PegaProx runs on a single gevent hub thread: every greenlet (all per-cluster
+# poll/balance loops + the WSGI request handlers) cooperatively shares ONE OS
+# thread. A sqlite3/SQLCipher query is a C call that does NOT yield to gevent,
+# so a heavy read freezes the ENTIRE hub for its full duration — measured at
+# ~0.65s for a 30-day metrics_history scan on a 4-cluster dev box (the hub
+# ticked 0 times during it), scaling linearly with cluster count (~5s+ at 10
+# clusters). That stall is the lag/freeze big deployments hit when someone
+# opens Insights / Cost / Power views.
+#
+# run_heavy_read runs the query on a FRESH, independent connection inside
+# gevent's OS threadpool. SQLCipher releases the GIL during its work, so the
+# hub thread keeps scheduling every other greenlet while the query runs in a
+# worker thread (measured: hub ticked 62x during the same 0.65s query when
+# offloaded — i.e. stayed fully responsive). Fresh-connection-per-call is
+# deliberate: the connection is opened, used, and closed entirely within the
+# one worker thread, so there is never cross-thread use of a shared sqlite
+# connection (unsafe even with check_same_thread=False). WAL mode (already on)
+# means this read connection doesn't lock-contend with the main writer.
+def run_heavy_read(sql: str, params: tuple = ()):  # noqa: ANN001
+    """Execute a read-only query off the gevent hub. Returns a list of Row
+    objects (column-name access preserved). Falls back to a direct in-thread
+    query when gevent's hub/threadpool isn't available (CLI / migration)."""
+    def _work():
+        from pegaprox.constants import DATABASE_FILE
+        conn = connect(DATABASE_FILE, timeout=30, check_same_thread=False)
+        try:
+            conn.row_factory = Row
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    try:
+        from gevent import get_hub
+        return get_hub().threadpool.apply(_work)
+    except Exception:
+        # No active hub (synchronous CLI context) — run inline.
+        return _work()
+
+
 # ─── Auto-migration on app startup ──────────────────────────────────────────
 # NS May 2026 — "nuklear" means auto-on-boot. The CLI tool is the manual
 # escape hatch; normal operators never have to think about migration.
