@@ -826,8 +826,19 @@ def require_auth(roles: list = None, perms: list = None):
                 return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
             
             # NS: Feb 2026 - Check if user was disabled while session/token is still active
-            users = load_users()
-            user = users.get(session['user'], {})
+            # H2 (scale audit): fetch ONLY the acting user (indexed, O(1)) instead of
+            # SELECT *-ing + decrypting the entire users table on every authed request.
+            # get_user() builds the identical dict get_all_users() would for this row.
+            try:
+                user = get_db().get_user(session['user']) or {}
+            except Exception:
+                user = load_users().get(session['user'], {})
+            # stash for check_cluster_access et al. so cluster-scoped routes don't refetch
+            try:
+                from flask import g as _g
+                _g.current_user = user
+            except Exception:
+                pass
             if not user.get('enabled', True):
                 return jsonify({'error': 'Account is disabled', 'code': 'ACCOUNT_DISABLED'}), 401
             

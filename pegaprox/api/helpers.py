@@ -326,11 +326,17 @@ def check_cluster_access(cluster_id):
     """Check if current user can access a cluster based on tenant or VM ACLs.
     Returns (True, None) if allowed, (False, error_response) if not.
     """
-    from flask import request, jsonify
-    from pegaprox.utils.auth import load_users
+    from flask import request, jsonify, g
     from pegaprox.utils.rbac import get_user_clusters
-    users = load_users()
-    user = users.get(request.session['user'], {})
+    # H2 (scale audit): reuse the acting user require_auth already fetched (g.current_user),
+    # else fetch just that one user — don't re-scan the whole users table per cluster route.
+    user = getattr(g, 'current_user', None)
+    if user is None:
+        try:
+            user = get_db().get_user(request.session['user']) or {}
+        except Exception:
+            from pegaprox.utils.auth import load_users
+            user = load_users().get(request.session['user'], {})
     allowed = get_user_clusters(user)
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
