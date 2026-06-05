@@ -2799,34 +2799,47 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
         # "allocation failed" on disk 1 of multi-disk migrations.
         rc, out, _ = _pve_node_exec(pve_mgr, node, attempt_cmd, timeout=90)
         out_str = str(out or '').strip()
-        
-        if rc == 0 and '400' not in out_str and 'error' not in out_str.lower() and 'failed' not in out_str.lower():
-            # Success -- extract vol_id
+        out_low = out_str.lower()
+
+        # MK 2026-06-05 (#529): the old gate was `rc == 0 and no error/failed text`.
+        # On cdickerson's base iSCSI-LVM, `pvesm alloc` emits a BENIGN notice
+        # ("Rounding up size to full physical extent <100.02 GiB" — lvm aligning
+        # the LV to the extent boundary) and returns non-zero, while the LV is
+        # still created. That tripped the rc==0 check → every disk "failed".
+        # Now: only hard-error keywords short-circuit; everything else is treated
+        # as maybe-ok and confirmed authoritatively via `pvesm path` (the volume
+        # either exists or it doesn't — that's the real source of truth).
+        real_err = ('400' in out_str or 'error' in out_low or 'failed' in out_low
+                    or 'not supported' in out_low or 'no space' in out_low
+                    or 'insufficient' in out_low)
+        if not real_err:
+            # extract vol_id
             vol_id = None
-            # Match: storage:vm-123-disk-0 or storage:vm-123-disk-0.raw
             m = re.search(r"(\S+:vm-\d+-disk-\d+(?:\.\w+)?)", out_str)
             if m:
                 vol_id = m.group(1).strip("'\"")
-            elif out_str and ':' in out_str:
-                # Sometimes output is just the vol_id
-                vol_id = out_str.split('\n')[0].strip().strip("'\"")
-            
+            elif out_str and ':' in out_str and 'vm-' in out_str:
+                # output is just the vol_id on its own line
+                vol_id = out_str.split('\n')[-1].strip().strip("'\"")
             if not vol_id:
                 vol_id = f"{storage}:{fn_raw}"
-            
-            # Get device path — quote vol_id to prevent shell splitting (#251)
+
+            # Get device path — quote vol_id to prevent shell splitting (#251).
+            # This is the authoritative check: a real /dev or file path means the
+            # volume exists, regardless of the alloc command's rc/warnings.
             rc_p, out_p, _ = _pve_node_exec(pve_mgr, node,
                 f"pvesm path {shlex.quote(vol_id)} 2>&1", timeout=10)
             dev_path = str(out_p or '').strip().split('\n')[0]
-
-            # #251: validate path starts with / — pvesm can return error text
-            # like "400 too many arguments" which then gets used as dd filename
             if dev_path.startswith('/') and rc_p == 0:
                 logging.info(f"[V2P] Disk allocated: {vol_id} → {dev_path} (via: {attempt_cmd[:60]})")
                 return vol_id, dev_path
-            else:
+
+            # path didn't resolve. Only trust a storage-type-derived path when
+            # the alloc itself was genuinely clean (rc==0) — for a non-zero
+            # benign-warning result we can't assume the LV exists, so fall through
+            # and let the next attempt (or the failure path) handle it.
+            if rc == 0:
                 logging.warning(f"[V2P] pvesm path failed for {vol_id}: {dev_path[:100]}")
-                # derive path from storage type instead of returning garbage
                 if storage_type in ('dir', 'nfs', 'cifs', 'glusterfs'):
                     derived = f"/mnt/pve/{storage}/images/{vmid}/{fn_raw}"
                 elif storage_type in ('lvmthin', 'lvm'):
@@ -2841,6 +2854,7 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
                 if errbuf is not None:
                     errbuf.append(f"alloc succeeded ({vol_id}) but volume path could not be resolved")
                 return None, None
+            last_error = (out_str or f"pvesm alloc rc={rc}, volume {vol_id} not found afterwards")[:150]
         else:
             last_error = out_str[:150]
     
