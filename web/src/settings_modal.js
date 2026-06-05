@@ -740,6 +740,7 @@
                 alert_cooldown: 300,
                 alert_update_available: false,
                 syslog_filter_by_selected_cluster: false,
+                syslog_enabled: true,
             });
             const [serverLoading, setServerLoading] = useState(false);
             const [showRestartConfirm, setShowRestartConfirm] = useState(false);
@@ -1552,6 +1553,7 @@
                             alert_cooldown: data.alert_cooldown || 300,
                             alert_update_available: !!data.alert_update_available,
                             syslog_filter_by_selected_cluster: !!data.syslog_filter_by_selected_cluster,
+                            syslog_enabled: data.syslog_enabled !== false,  // default on
                             // Security settings
                             login_max_attempts: data.login_max_attempts || 5,
                             login_lockout_time: data.login_lockout_time || 300,
@@ -1775,6 +1777,7 @@
                     }
                     formData.append('alert_update_available', serverSettings.alert_update_available ? 'true' : 'false');
                     formData.append('syslog_filter_by_selected_cluster', serverSettings.syslog_filter_by_selected_cluster ? 'true' : 'false');
+                    formData.append('syslog_enabled', serverSettings.syslog_enabled ? 'true' : 'false');
 
                     if (serverSettings.ssl_cert_file) {
                         formData.append('ssl_cert', serverSettings.ssl_cert_file);
@@ -5458,6 +5461,27 @@
                                             <div>
                                                 <h4 className="font-medium text-white flex items-center gap-2">
                                                     <Icons.FileText />
+                                                    {t('syslogEnabled') || 'Syslog receiver'}
+                                                </h4>
+                                                <p className="text-sm text-gray-400 mt-1">
+                                                    {t('syslogEnabledDesc') || 'Listen for syslog messages on UDP/TCP port 1514. Disable to close the port if PegaProx does not ingest syslog from your nodes.'}
+                                                </p>
+                                            </div>
+                                            <label className="flex items-center gap-2 cursor-pointer shrink-0">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={!!serverSettings.syslog_enabled}
+                                                    onChange={e => setServerSettings({...serverSettings, syslog_enabled: e.target.checked})}
+                                                    className="rounded border-proxmox-border bg-proxmox-darker"
+                                                />
+                                                <span className="text-sm text-gray-300">{t('enabled') || 'Enabled'}</span>
+                                            </label>
+                                        </div>
+
+                                        <div className="flex items-center justify-between gap-4 border-t border-proxmox-border pt-4">
+                                            <div>
+                                                <h4 className="font-medium text-white flex items-center gap-2">
+                                                    <Icons.FileText />
                                                     {t('syslogClusterFilter') || 'Cluster-scoped syslog viewer'}
                                                 </h4>
                                                 <p className="text-sm text-gray-400 mt-1">
@@ -5485,7 +5509,8 @@
                                                             credentials: 'include',
                                                             headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
                                                             body: JSON.stringify({
-                                                                syslog_filter_by_selected_cluster: !!serverSettings.syslog_filter_by_selected_cluster
+                                                                syslog_filter_by_selected_cluster: !!serverSettings.syslog_filter_by_selected_cluster,
+                                                                syslog_enabled: !!serverSettings.syslog_enabled
                                                             })
                                                         });
                                                         if (response && response.ok) {

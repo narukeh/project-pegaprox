@@ -1266,6 +1266,19 @@ def update_server_settings():
                 if old_val != settings['syslog_filter_by_selected_cluster']:
                     log_audit(request.session.get('user', 'admin'), 'settings.syslog',
                               f"Syslog cluster hostname filter {'enabled' if settings['syslog_filter_by_selected_cluster'] else 'disabled'}")
+            # NS 2026-06-05 — Settings → Syslog: enable/disable the receiver, applied live.
+            if 'syslog_enabled' in data:
+                old_se = settings.get('syslog_enabled', True)
+                settings['syslog_enabled'] = bool(data['syslog_enabled'])
+                if old_se != settings['syslog_enabled']:
+                    save_server_settings(settings)  # persist before (re)start so the boot gate agrees
+                    try:
+                        from pegaprox.background.syslog_server import start_syslog_server, stop_syslog_server
+                        start_syslog_server() if settings['syslog_enabled'] else stop_syslog_server()
+                    except Exception as _se:
+                        logging.warning(f"[Settings] syslog toggle apply failed: {_se}")
+                    log_audit(request.session.get('user', 'admin'), 'settings.syslog',
+                              f"Syslog receiver {'enabled' if settings['syslog_enabled'] else 'disabled'}")
             if 'strict_session_ip' in data:
                 settings['strict_session_ip'] = bool(data['strict_session_ip'])
 
@@ -1509,6 +1522,23 @@ def update_server_settings():
                 if old_syslog_filter != settings['syslog_filter_by_selected_cluster']:
                     log_audit(request.session.get('user', 'admin'), 'settings.syslog',
                               f"Syslog cluster hostname filter {'enabled' if settings['syslog_filter_by_selected_cluster'] else 'disabled'}")
+            # NS 2026-06-05 — Settings → Syslog: enable/disable the receiver (port 1514).
+            # Applied live so the toggle opens/closes the port without a restart.
+            if 'syslog_enabled' in request.form:
+                old_syslog_enabled = settings.get('syslog_enabled', True)
+                settings['syslog_enabled'] = request.form['syslog_enabled'] in ('true', '1', 'on')
+                if old_syslog_enabled != settings['syslog_enabled']:
+                    save_server_settings(settings)  # persist before (re)starting so the boot-time gate agrees
+                    try:
+                        from pegaprox.background.syslog_server import start_syslog_server, stop_syslog_server
+                        if settings['syslog_enabled']:
+                            start_syslog_server()
+                        else:
+                            stop_syslog_server()
+                    except Exception as _se:
+                        logging.warning(f"[Settings] syslog toggle apply failed: {_se}")
+                    log_audit(request.session.get('user', 'admin'), 'settings.syslog',
+                              f"Syslog receiver {'enabled' if settings['syslog_enabled'] else 'disabled'}")
 
             # Handle certificate upload
             if 'ssl_cert' in request.files:

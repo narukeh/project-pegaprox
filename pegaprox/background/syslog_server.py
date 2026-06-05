@@ -35,6 +35,12 @@ import queue as _queue
 _LOG_QUEUE = _queue.Queue(maxsize=20000)
 _DROPPED = 0
 
+# Runtime start/stop so the Settings → Syslog toggle can open/close the port live
+# (not only on restart). The listeners track their socket here so stop can close it.
+_stop_event = threading.Event()
+_udp_sock = None
+_tcp_sock = None
+
 
 def _enqueue_log(entry):
     global _DROPPED
@@ -240,16 +246,18 @@ def parse_syslog(message):
 def _udp_listener(host, port):
     """UDP syslog listener using plain sockets (gevent-compatible)"""
     import socket
+    global _udp_sock
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
+        _udp_sock = sock
         logging.info(f"[Syslog] UDP listening on {host}:{port}")
     except OSError as e:
         logging.warning(f"[Syslog] UDP bind failed on {host}:{port}: {e}")
         return
 
-    while True:
+    while not _stop_event.is_set():
         try:
             data, addr = sock.recvfrom(8192)
             message = data.decode(errors="ignore").strip()
@@ -262,6 +270,8 @@ def _udp_listener(host, port):
             )
             _enqueue_log(entry)
         except Exception as e:
+            if _stop_event.is_set():
+                break  # socket closed by stop_syslog_server
             logging.debug(f"[Syslog] UDP error: {e}")
             time.sleep(0.1)
 
@@ -272,11 +282,13 @@ def _tcp_listener(host, port):
     import gevent
     from gevent import socket as gsocket
 
+    global _tcp_sock
     srv = gsocket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         srv.bind((host, port))
         srv.listen(32)
+        _tcp_sock = srv
         logging.info(f"[Syslog] TCP listening on {host}:{port}")
     except OSError as e:
         logging.warning(f"[Syslog] TCP bind failed on {host}:{port}: {e}")
@@ -305,11 +317,13 @@ def _tcp_listener(host, port):
         finally:
             client_sock.close()
 
-    while True:
+    while not _stop_event.is_set():
         try:
             client, addr = srv.accept()
             gevent.spawn(handle_client, client, addr)
         except Exception as e:
+            if _stop_event.is_set():
+                break  # socket closed by stop_syslog_server
             logging.debug(f"[Syslog] TCP accept error: {e}")
             time.sleep(0.1)
 
@@ -348,7 +362,32 @@ def start_syslog_server():
     global _syslog_thread
     if _syslog_thread is not None:
         return
-
+    _stop_event.clear()  # in case we were stopped earlier via the settings toggle
     _syslog_thread = threading.Thread(target=_syslog_loop, daemon=True, name='syslog-server')
     _syslog_thread.start()
     logging.info("[Syslog] Background thread started")
+
+
+def stop_syslog_server():
+    """Stop the syslog receiver and free port 1514 (Settings → Syslog toggle off).
+
+    Sets the stop flag and closes the listening sockets, which unblocks the
+    recvfrom()/accept() loops so they exit. Idempotent. NS 2026-06-05."""
+    global _syslog_thread, _udp_sock, _tcp_sock
+    if _syslog_thread is None:
+        return
+    _stop_event.set()
+    for s in (_udp_sock, _tcp_sock):
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+    _udp_sock = None
+    _tcp_sock = None
+    _syslog_thread = None
+    logging.info("[Syslog] receiver stopped — port 1514 released (syslog_enabled=false)")
+
+
+def is_syslog_running():
+    return _syslog_thread is not None

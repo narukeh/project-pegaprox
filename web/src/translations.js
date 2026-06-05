@@ -98,6 +98,8 @@
                 forceDeletePlan: 'Diesen hängenden Plan zwangsweise löschen?',
                 refresh: 'Aktualisieren',
                 syslogServer: 'Syslog Server',
+                syslogEnabled: 'Syslog-Empfänger',
+                syslogEnabledDesc: 'Lauscht auf Syslog-Nachrichten auf UDP/TCP-Port 1514. Deaktivieren schließt den Port, falls PegaProx kein Syslog von deinen Nodes empfangen soll.',
                 syslogClusterFilter: 'Cluster-begrenzter Syslog-Viewer',
                 syslogClusterFilterDesc: 'Wenn aktiviert, zeigt das Syslog-Kapitel nur Logzeilen, deren Hostname zum ausgewählten Cluster oder seinen Nodes gehört.',
 
@@ -4095,6 +4097,8 @@
                 forceDeletePlan: 'Force-delete this stuck plan?',
                 refresh: 'Refresh',
                 syslogServer: 'Syslog Server',
+                syslogEnabled: 'Syslog receiver',
+                syslogEnabledDesc: 'Listen for syslog messages on UDP/TCP port 1514. Disable to close the port if PegaProx does not ingest syslog from your nodes.',
                 syslogClusterFilter: 'Cluster-scoped syslog viewer',
                 syslogClusterFilterDesc: 'When enabled, the Syslog chapter only shows log rows whose hostname belongs to the selected cluster or one of its nodes.',
 
