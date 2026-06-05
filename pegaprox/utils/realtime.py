@@ -20,6 +20,13 @@ from pegaprox.globals import (
     ws_tokens, ws_tokens_lock,
 )
 
+# NS 2026-06-05 (#528 scaling): max SSE/WS broadcast message size. The old hard
+# 500KB cap silently dropped any broadcast above it — a cluster with thousands
+# of VMs has a `resources` payload well over 500KB, so its live UI just stopped
+# updating with only a log warning. Raised to 5MB, env-overridable. (The real
+# long-term fix is per-cluster subscription so a client only gets its own data.)
+_MAX_BROADCAST_BYTES = int(os.environ.get('PEGAPROX_MAX_BROADCAST_BYTES', str(5_000_000)))
+
 
 def push_immediate_update(cluster_id: str, delay: float = 0.3):
     """NS: push immediate SSE update after VM actions for faster UI feedback"""
@@ -60,7 +67,7 @@ def broadcast_update(update_type: str, data: dict, cluster_id: str = None):
         })
 
         # Limit message size
-        if len(message) > 500000:  # 500KB limit
+        if len(message) > _MAX_BROADCAST_BYTES:
             logging.warning(f"Broadcast message too large ({len(message)} bytes), skipping")
             return
 
@@ -221,7 +228,8 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None):
             return
 
         # Limit message size
-        if len(message) > 500000:
+        if len(message) > _MAX_BROADCAST_BYTES:
+            logging.warning(f"SSE message too large ({len(message)} bytes), skipping")
             return
 
         # Determine if this is a cluster-specific event
