@@ -17,6 +17,13 @@ from pegaprox.globals import (
 )
 from pegaprox.utils.realtime import broadcast_sse
 
+# NS 2026-06-05 (#528 scaling): per-cluster "broadcast greenlet in flight" flags.
+# The loop spawns one greenlet per cluster every ~1s; a slow-but-not-erroring
+# cluster (the cooldown only catches erroring ones) would otherwise stack a fresh
+# greenlet every second behind the stuck one. We skip re-spawning a cluster whose
+# previous greenlet hasn't finished yet.
+_broadcast_inflight = {}
+
 # NS: map portal audit actions to task-like type strings
 _AUDIT_ACTION_MAP = {
     'portal.vm.start': 'portalstart',
@@ -256,11 +263,18 @@ def broadcast_resources_loop():
                         
                 except Exception as e:
                     logging.debug(f"Error broadcasting updates for {cid}: {e}")
-            
+                finally:
+                    _broadcast_inflight[cid] = False
+
             # NS: Run each cluster broadcast in its own thread with 8s max
             # Prevents one slow/timing-out cluster from blocking all SSE updates
             threads = []
             for cluster_id, manager in list(cluster_managers.items()):
+                # skip if this cluster's previous broadcast greenlet is still
+                # running (slow cluster) — avoids piling up one per second (#528)
+                if _broadcast_inflight.get(cluster_id):
+                    continue
+                _broadcast_inflight[cluster_id] = True
                 t = threading.Thread(target=broadcast_for_cluster, args=(cluster_id, manager), daemon=True)
                 t.start()
                 threads.append(t)

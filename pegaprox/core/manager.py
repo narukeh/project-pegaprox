@@ -1237,7 +1237,24 @@ class PegaProxManager:
                     for name, data in self.ha_node_status.items()
                 }
             return {}
-        
+
+        # NS 2026-06-05 (#528 scaling): short result cache. get_node_status
+        # fans out 2 HTTP calls PER NODE; the broadcast loop calls it every ~1s
+        # per cluster, so at 100+ nodes that's a per-second node-poll storm (it
+        # never used the existing nodes-TTL). Reuse a recent result instead.
+        # Default 5s, PEGAPROX_NODE_STATUS_TTL=0 disables.
+        _ns_ttl = getattr(self, '_node_status_ttl', None)
+        if _ns_ttl is None:
+            try:
+                _ns_ttl = float(os.environ.get('PEGAPROX_NODE_STATUS_TTL', '5'))
+            except (TypeError, ValueError):
+                _ns_ttl = 5.0
+            self._node_status_ttl = _ns_ttl
+        if _ns_ttl > 0:
+            _ns_ent = getattr(self, '_node_status_cache', None)
+            if _ns_ent and _ns_ent[1] and (time.monotonic() - _ns_ent[0]) < _ns_ttl:
+                return _ns_ent[1]
+
         try:
             host = self.host
             url = f"https://{host}:{self.api_port}/api2/json/nodes"
@@ -1554,7 +1571,10 @@ class PegaProxManager:
                             'last_seen': ha_data.get('last_seen').isoformat() if ha_data.get('last_seen') else None
                         }
                         self.logger.info(f"Node {ha_node}: OFFLINE (from HA tracking)")
-                
+
+                # cache the successful result for the short TTL (see top of method)
+                if _ns_ttl > 0 and node_status:
+                    self._node_status_cache = (time.monotonic(), node_status)
                 return node_status
             else:
                 # Session might have expired - don't immediately mark as disconnected
