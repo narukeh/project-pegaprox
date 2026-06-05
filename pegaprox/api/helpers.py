@@ -98,6 +98,10 @@ def load_server_settings():
         # port on installs that don't ingest syslog. (DoS-safe either way now —
         # ingestion is bounded-queue + batched off-hub.)
         'syslog_enabled': True,
+        # NS 2026-06-05 (S1): retention for the syslog receiver DB (syslog.db). The
+        # receiver only INSERTs, so without a sweep it grows unbounded on the same
+        # volume as the main DB. Pruned ~hourly by the drain loop.
+        'syslog_retention_days': 30,
         # Webhook alert channels (Slack, Discord, Teams, ntfy, generic)
         # Each: {id, name, type, url, enabled, ...type-specific fields}
         'alert_webhooks': [],
@@ -265,6 +269,18 @@ def register_task_user(upid: str, username: str, cluster_id: str = None):
     # Update in-memory cache
     with task_pegaprox_users_lock:
         task_pegaprox_users_cache[upid] = {'user': username, 'timestamp': time.time()}
+        # S2 (regression scan): this dict was never evicted (TASK_USER_CACHE_TTL was
+        # dead) → slow unbounded RSS creep over weeks. Bound it: when over the cap,
+        # drop the oldest ~10% by timestamp. The DB row remains the source of truth
+        # (get_task_user falls back to the DB on a cache miss).
+        if len(task_pegaprox_users_cache) > 50000:
+            try:
+                _old = sorted(task_pegaprox_users_cache.items(),
+                              key=lambda kv: kv[1].get('timestamp', 0))[:5000]
+                for _k, _ in _old:
+                    task_pegaprox_users_cache.pop(_k, None)
+            except Exception:
+                task_pegaprox_users_cache.clear()
     
     # Persist to database
     try:

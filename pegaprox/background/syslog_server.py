@@ -68,28 +68,75 @@ def _flush_batch(batch):
             pass
 
 
+def _prune_old_logs():
+    """S1: delete syslog rows older than the retention window (off-hub). The
+    receiver only ever INSERTs, so without this syslog.db grows unbounded on the
+    same volume as the main encrypted DB. The fts5 logs_ad trigger keeps the FTS
+    index in sync. timestamp is indexed (idx_logs_timestamp_id). NS 2026-06-05."""
+    try:
+        days = 30
+        try:
+            from pegaprox.api.helpers import load_server_settings
+            days = max(1, min(3650, int(load_server_settings().get('syslog_retention_days', 30) or 30)))
+        except Exception:
+            pass
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        conn = _open_db(timeout=30)
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM logs WHERE timestamp < ?", (cutoff,))
+            n = cur.rowcount
+            conn.commit()
+            if n and n > 0:
+                logging.info(f"[Syslog] retention prune: deleted {n} rows older than {days}d")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logging.debug(f"[Syslog] retention prune failed: {e}")
+
+
 def _drain_loop():
-    """Batch queued syslog entries and flush them off the hub."""
+    """Batch queued syslog entries + flush them off the hub. Stop-aware (S5) so it
+    exits within ~1s of stop_syslog_server (no leaked greenlet per OFF→ON toggle),
+    and runs a periodic retention prune (S1)."""
     try:
         from gevent import get_hub
     except Exception:
         get_hub = None
-    while True:
+
+    def _offhub(fn, args=()):
+        if get_hub is not None:
+            get_hub().threadpool.apply(fn, args)
+        else:
+            fn(*args)
+
+    last_prune = 0.0   # 0 → prune shortly after start, then hourly
+    while not _stop_event.is_set():
+        batch = []
         try:
-            batch = [_LOG_QUEUE.get()]          # block (cooperatively) until one arrives
-            for _ in range(999):                # drain up to 1000/batch without blocking
-                try:
-                    batch.append(_LOG_QUEUE.get_nowait())
-                except _queue.Empty:
-                    break
-            if get_hub is not None:
-                get_hub().threadpool.apply(_flush_batch, (batch,))
-            else:
-                _flush_batch(batch)
+            try:
+                batch = [_LOG_QUEUE.get(timeout=1.0)]   # timed so we can notice _stop_event
+            except _queue.Empty:
+                batch = []
+            if batch:
+                for _ in range(999):
+                    try:
+                        batch.append(_LOG_QUEUE.get_nowait())
+                    except _queue.Empty:
+                        break
+                _offhub(_flush_batch, (batch,))
+            if time.monotonic() - last_prune > 3600:
+                last_prune = time.monotonic()
+                _offhub(_prune_old_logs)
         except Exception as e:
             logging.debug(f"[Syslog] drain error: {e}")
             time.sleep(0.5)
-        time.sleep(0.5)                          # coalesce → at most ~2 batched writes/sec
+        if batch:
+            time.sleep(0.5)                              # coalesce under load → ~2 writes/sec
 
 
 def _open_db(timeout=30):
