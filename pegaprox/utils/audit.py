@@ -95,9 +95,15 @@ def cleanup_audit_log():
                 retention = max(30, min(3650, int(v)))
         except Exception:
             pass
-        deleted = db.cleanup_audit_log(days=retention)
-        if deleted > 0:
-            logging.info(f"Cleaned up {deleted} old audit log entries (retention={retention}d)")
+        # M5 (scale audit): run the prune OFF the hub. This function was never
+        # being called (audit_retention_days went unenforced → audit_log grew
+        # unbounded), so the first prune on a months-old install can delete a lot
+        # — don't block the gevent event loop on it. Indexed DELETE on timestamp.
+        from datetime import datetime as _dt, timedelta as _td
+        from pegaprox.core.dbcrypto import run_heavy_write
+        cutoff = (_dt.now() - _td(days=retention)).isoformat()
+        run_heavy_write(statements=[("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))])
+        logging.info(f"Audit-log retention prune ran (retention={retention}d, cutoff<{cutoff[:10]})")
     except Exception as e:
         logging.error(f"Failed to cleanup audit log: {e}")
 

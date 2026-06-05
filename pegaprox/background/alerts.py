@@ -708,6 +708,28 @@ def _periodic_session_cleanup():
         logging.debug(f"[SessionCleanup] background pass failed: {e}")
 
 
+_AUDIT_CLEANUP_INTERVAL = 24 * 60 * 60   # daily
+_last_audit_cleanup_at = 0.0
+
+
+def _periodic_audit_cleanup():
+    """M5 (scale audit): enforce audit_retention_days. cleanup_audit_log() was
+    never called anywhere, so audit_log grew unbounded — bloating the DB and
+    making the get_tasks LIKE fallback + audit search/integrity scans slower over
+    the install lifetime. Daily, piggy-backing the alert loop; the prune runs
+    off-hub via run_heavy_write (see audit.cleanup_audit_log)."""
+    global _last_audit_cleanup_at
+    now = time.time()
+    if now - _last_audit_cleanup_at < _AUDIT_CLEANUP_INTERVAL:
+        return
+    _last_audit_cleanup_at = now
+    try:
+        from pegaprox.utils.audit import cleanup_audit_log
+        cleanup_audit_log()
+    except Exception as e:
+        logging.debug(f"[AuditCleanup] background pass failed: {e}")
+
+
 def alert_check_loop():
     """Background thread that checks alerts periodically"""
     global _alert_running
@@ -730,6 +752,10 @@ def alert_check_loop():
             _periodic_session_cleanup()
         except Exception as e:
             logging.debug(f"session cleanup tick error: {e}")
+        try:
+            _periodic_audit_cleanup()
+        except Exception as e:
+            logging.debug(f"audit cleanup tick error: {e}")
 
         # Check every 60 seconds
         time.sleep(60)
