@@ -75,6 +75,14 @@ try:
 except ImportError:
     pass
 
+# H1 (scale audit 2026-06-05): negative-cache UPIDs whose initiating PegaProx user
+# can't be resolved from audit_log. The get_tasks() audit-log LIKE fallback runs
+# on the hub every ~1s broadcast tick per unmatched task; system/automation tasks
+# (cron vzdump, replication, HA) never match, so without this they re-scan forever.
+# Bounded dict (cleared wholesale when full — simple + bounded).
+_TASK_USER_NEGCACHE = {}
+_TASK_USER_NEGCACHE_MAX = 5000
+
 def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
     # MK 2026-05-31 — paired bugfix with utils/concurrent.py: gevent.pool.Pool's
     # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
@@ -7197,7 +7205,24 @@ echo "AGENT_INSTALLED_OK"
         # Fail early if we're not connected to avoid hanging
         if not self.is_connected or not self.session:
             return []
-        
+
+        # H1 (scale audit): short result cache so the ~1s broadcast loop doesn't
+        # re-fetch + re-resolve users every second. 3s default, PEGAPROX_TASKS_TTL=0 off.
+        _tt = getattr(self, '_tasks_ttl', None)
+        if _tt is None:
+            try:
+                _tt = float(os.environ.get('PEGAPROX_TASKS_TTL', '3'))
+            except (TypeError, ValueError):
+                _tt = 3.0
+            self._tasks_ttl = _tt
+        _tcache = getattr(self, '_tasks_cache', None)
+        if _tcache is None:
+            _tcache = self._tasks_cache = {}
+        if _tt > 0:
+            _ent = _tcache.get(limit)
+            if _ent and _ent[1] and (time.monotonic() - _ent[0]) < _tt:
+                return _ent[1]
+
         tasks = []
         try:
             host = self.host
@@ -7233,7 +7258,7 @@ echo "AGENT_INSTALLED_OK"
                     # rest we infer from audit_log by matching task type → known action,
                     # vmid in details, and a tight time window around the task starttime.
                     # Survives F5 because audit_log is persistent.
-                    if not pegaprox_user:
+                    if not pegaprox_user and (task_info.get('upid') or '') not in _TASK_USER_NEGCACHE:
                         try:
                             from pegaprox.core.db import get_db
                             _db = get_db()
@@ -7282,6 +7307,12 @@ echo "AGENT_INSTALLED_OK"
                                     register_task_user(task_info['upid'], task_info['pegaprox_user'], self.id)
                                 except Exception:
                                     pass
+                            elif task_info.get('upid'):
+                                # H1: no audit match (system/automation task) — negative-cache
+                                # so we don't re-run this scan every broadcast tick.
+                                if len(_TASK_USER_NEGCACHE) >= _TASK_USER_NEGCACHE_MAX:
+                                    _TASK_USER_NEGCACHE.clear()
+                                _TASK_USER_NEGCACHE[task_info['upid']] = True
                         except Exception:
                             pass
 
@@ -7307,7 +7338,9 @@ echo "AGENT_INSTALLED_OK"
             
             # Sort by starttime descending (newest first)
             tasks.sort(key=lambda x: x.get('starttime') or 0, reverse=True)
-            
+
+            if _tt > 0:
+                _tcache[limit] = (time.monotonic(), tasks)
             return tasks
             
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
