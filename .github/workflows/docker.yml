@@ -1,11 +1,12 @@
 name: Build Docker Image
 
 # MK: builds multi-arch image and pushes to ghcr.io
-# triggered on version tags and main pushes
-
+# NS 2026-06-05 — only build on a released version tag (v*), NOT on every main
+# push. main moves constantly and we don't want a Docker image per commit; the
+# v* tag is pushed when a release is cut. workflow_dispatch stays as the manual
+# escape hatch (a dispatch from main still refreshes :latest via is_default_branch).
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 

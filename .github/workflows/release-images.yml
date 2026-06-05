@@ -16,7 +16,7 @@ permissions:
 env:
   PVE_PORT: "5000"
   DEBIAN_RELEASE: "trixie"
-  APT_POLL_RETRIES: "120"
+  APT_POLL_RETRIES: "150"   # NS 2026-06-05 — gyptazy repo can lag; give it longer
   APT_POLL_INTERVAL: "30"
 
 jobs:
@@ -242,6 +242,11 @@ jobs:
         run: |
           mv rootfs.tar.xz \
             "pegaprox-${{ needs.prepare.outputs.version }}-lxc-amd64.tar.xz"
+          # NS 2026-06-05 — also ship a stable -latest- name so the GitHub
+          # releases/latest/download/ URL always resolves to the newest LXC
+          # template (same as Docker's :latest). Byte-identical copy.
+          cp "pegaprox-${{ needs.prepare.outputs.version }}-lxc-amd64.tar.xz" \
+             "pegaprox-latest-lxc-amd64.tar.xz"
 
       - name: Artefakt sichern
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
